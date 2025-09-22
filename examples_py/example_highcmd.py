@@ -1,5 +1,6 @@
 import sys
-sys.path.append("../lib")
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "lib"))
 import unitree_arm_interface
 import time
 import numpy as np
