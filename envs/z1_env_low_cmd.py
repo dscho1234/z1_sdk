@@ -33,6 +33,7 @@ class EEPoseCtrlLowCmdWrapper(Z1BaseEnv):
             orientation_tolerance: Orientation tolerance for reaching target
             move_speed: Movement speed multiplier (0.1 to 1.0)
             move_timeout: Timeout for movement completion in seconds
+            inference_time: Time taken for neural network inference (seconds)
         """
         # Initialize base class
         super().__init__(has_gripper, control_frequency)
@@ -42,6 +43,7 @@ class EEPoseCtrlLowCmdWrapper(Z1BaseEnv):
         self.orientation_tolerance = orientation_tolerance
         self.move_speed = move_speed
         self.move_timeout = move_timeout
+        # inference_time is not stored as self, it's passed per step
         
         # Target pose
         self.target_position = np.zeros(3)
@@ -96,13 +98,14 @@ class EEPoseCtrlLowCmdWrapper(Z1BaseEnv):
         
         return self._get_observation()
     
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+    def step(self, action: np.ndarray, inference_time: float = 0.15) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         """
         Execute one step with end-effector pose control using inverse kinematics.
         This follows the example_lowcmd.py approach with real IK.
         
         Args:
             action: [x, y, z, qw, qx, qy, qz, gripper] target pose
+            inference_time: Time taken for neural network inference (seconds)
             
         Returns:
             observation: Current observation
@@ -156,37 +159,41 @@ class EEPoseCtrlLowCmdWrapper(Z1BaseEnv):
             self.step_count = 0
             self.total_steps = 1
         
-        # Execute one step of the movement (like example_lowcmd.py)
+        # Calculate actual control time (dt - inference_time)
+        actual_control_time = max(self.dt - inference_time, 0.001)  # Minimum 1ms control time
+        
+        # Calculate dt ratio for internal loop using actual control time
+        dt_ratio = int(actual_control_time / self.arm._ctrlComp.dt)
+        
+        # Execute movement with proper timing (like example_lowcmd.py)
         if hasattr(self, 'target_joint_pos') and self.step_count < self.total_steps:
-            # Interpolate between start and target joint positions (like example_lowcmd.py)
-            progress = self.step_count / self.total_steps
-            current_joint_pos = self.start_joint_pos * (1 - progress) + self.target_joint_pos * progress
-            
-            # Calculate joint velocities (like example_lowcmd.py)
-            joint_vel = (self.target_joint_pos - self.start_joint_pos) / (self.total_steps * self.dt)
-            
-            # Calculate required torques using inverse dynamics (like example_lowcmd.py)
-            joint_acc = np.zeros(6)
-            gravity_comp = np.zeros(6)
-            target_torque = self.arm_model.inverseDynamics(current_joint_pos, joint_vel, joint_acc, gravity_comp)
-            
-            # Set gripper target
-            gripper_target = self.target_gripper
-            # gripper_vel = (gripper_target - self.current_gripper_pos) / (self.total_steps * self.dt)
-            # gripper_torque = 0.0  # Simple gripper control
-            
-            # Send low-level commands (like example_lowcmd.py)
-            self.arm.q = current_joint_pos
-            self.arm.qd = joint_vel
-            self.arm.tau = target_torque
-            self.arm.gripperQ = gripper_target
-            # self.arm.gripperQd = gripper_vel
-            # self.arm.gripperTau = gripper_torque
-            
-            # Send commands to robot
-            self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
-            self.arm.setGripperCmd(self.arm.gripperQ, self.arm.gripperQd, self.arm.gripperTau)
-            self.arm.sendRecv()
+            # Send low-level commands with proper timing (like example_lowcmd.py)
+            for i in range(dt_ratio):
+                # Calculate current progress within this step (like example_lowcmd.py)
+                # Total progress includes both step_count and current iteration within step
+                total_progress = (self.step_count * dt_ratio + i) / (self.total_steps * dt_ratio)
+                
+                # Interpolate between start and target joint positions (like example_lowcmd.py)
+                current_joint_pos = self.start_joint_pos * (1 - total_progress) + self.target_joint_pos * total_progress
+                
+                # Calculate joint velocities (like example_lowcmd.py)
+                joint_vel = (self.target_joint_pos - self.start_joint_pos) / (self.total_steps * self.dt)
+                
+                # Calculate required torques using inverse dynamics (like example_lowcmd.py)
+                joint_acc = np.zeros(6)
+                gravity_comp = np.zeros(6)
+                target_torque = self.arm_model.inverseDynamics(current_joint_pos, joint_vel, joint_acc, gravity_comp)
+                
+                # Set gripper target (like example_lowcmd.py)
+                gripper_target = self.target_gripper * total_progress
+                gripper_vel = (self.target_gripper - self.current_gripper_pos) / (self.total_steps * self.dt)
+                gripper_torque = 0.0  # Simple gripper control
+                
+                # Send commands to robot
+                self.arm.setArmCmd(current_joint_pos, joint_vel, target_torque)
+                self.arm.setGripperCmd(gripper_target, gripper_vel, gripper_torque)
+                self.arm.sendRecv()
+                time.sleep(self.arm._ctrlComp.dt)
             
             # Update step count
             self.step_count += 1
@@ -200,9 +207,6 @@ class EEPoseCtrlLowCmdWrapper(Z1BaseEnv):
             # Movement completed
             self.is_moving = False
             print("Movement completed")
-        
-        # Wait for dt (like example_lowcmd.py)
-        time.sleep(self.dt)
         
         # Update state
         self._update_state()
@@ -221,7 +225,10 @@ class EEPoseCtrlLowCmdWrapper(Z1BaseEnv):
             'position_error': np.linalg.norm(self.target_position - self._get_current_ee_position()),
             'orientation_error': self._quaternion_distance(
                 self.target_orientation, self._get_current_ee_orientation()
-            )
+            ),
+            'dt_ratio': dt_ratio,
+            'actual_control_time': actual_control_time,
+            'inference_time': inference_time
         }
         
         self.episode_step += 1

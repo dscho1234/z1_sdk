@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Example usage of the Z1 Gym environment with end-effector pose control.
+Example usage of the Z1 Gym environment with end-effector pose control using cartesian commands.
 
-This example demonstrates how to use the EEPoseCtrlWrapper to control
-the Z1 robot arm's end-effector pose using MoveJ commands.
+This example demonstrates how to use the EEPoseCtrlCartesianCmdWrapper to control
+the Z1 robot arm's end-effector pose using cartesianCtrlCmd velocity commands.
 """
 
 import sys
@@ -13,23 +13,30 @@ import time
 
 # Add the envs directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "envs"))
-from envs.z1_env import EEPoseCtrlWrapper
+from envs.z1_env import EEPoseCtrlCartesianCmdWrapper
 
 
 def main():
     """Main example function."""
-    print("Z1 Gym Environment Example - End-Effector Pose Control")
-    print("=" * 60)
+    print("Z1 Gym Environment Example - End-Effector Pose Control with Cartesian Commands")
+    print("=" * 80)
     
     # Create the environment with 5Hz control frequency
     control_frequency = 5
-    env = EEPoseCtrlWrapper(
+    inference_time = 0.01 # 15  # Neural network inference time (can be changed each time)
+    '''
+    How to address slow inference
+    1. RTC
+    2. super slow velocity (cannot reach the desired pose with the given time, but anyway we can do inference at that pose.)
+    '''
+    
+    env = EEPoseCtrlCartesianCmdWrapper(
         has_gripper=True,
         control_frequency=control_frequency,  # 5Hz control frequency
-        position_tolerance=0.005,
+        position_tolerance=0.01,
         orientation_tolerance=0.1,
-        move_speed=10.0,  # Slower speed to test timeout behavior
-        move_timeout=float(1/control_frequency)  # 5 seconds timeout to allow actual movement
+        angular_vel=0.3,  # Angular velocity limit
+        linear_vel=0.3,   # Linear velocity limit
     )
     
     print(f"Action space: {env.action_space}")
@@ -53,10 +60,12 @@ def main():
             traceback.print_exc()
             return
         
-        # Example: Square movement in YZ plane using MoveJ commands
-        print("Example: Square movement in YZ plane using MoveJ commands")
-        print("MoveJ commands will return immediately and FSM state will be monitored")
-        print(f"Timeout setting: {env.move_timeout} seconds")
+        # Example: Cartesian velocity control for square movement in YZ plane
+        print("Example: Cartesian velocity control for square movement in YZ plane")
+        print("Using cartesianCtrlCmd for continuous velocity control")
+        print(f"Control frequency: {control_frequency} Hz")
+        print(f"Angular velocity limit: {env.angular_vel} rad/s")
+        print(f"Linear velocity limit: {env.linear_vel} m/s")
         print()
         
         # Get current end-effector position and orientation from observation
@@ -84,10 +93,11 @@ def main():
         print()
         
         # Move along square path in 100 steps
-        total_steps = 100
+        total_steps = 25
         steps_per_edge = total_steps // 4  # 4 edges of the square
         
         print(f"Moving along square path in {total_steps} steps ({steps_per_edge} steps per edge)")
+        print(f"Inference time: {inference_time}s (simulated neural network processing)")
         print()
         
         for step in range(total_steps):
@@ -111,8 +121,11 @@ def main():
             # Create action
             action = np.concatenate([target_position, current_orientation, [target_gripper]])
             
-            # Send command - step() function handles timing internally
-            obs, reward, done, info = env.step(action)
+            # Simulate neural network inference time
+            time.sleep(inference_time)
+            
+            # Send command with inference time
+            obs, reward, done, info = env.step(action, inference_time)
             
             # Print progress every 10 steps
             if step % 10 == 0:
@@ -120,7 +133,7 @@ def main():
                 position_error = info['position_error']
                 print(f"Step {step:3d}: Current pos: [{current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}], "
                       f"Target: [{target_position[0]:.3f}, {target_position[1]:.3f}, {target_position[2]:.3f}], "
-                      f"Error: {position_error:.4f}, FSM: {info['fsm_state']}")
+                      f"Error: {position_error:.4f}")
             
             if done:
                 print(f"Episode finished at step {step}!")
@@ -133,42 +146,51 @@ def main():
         print(f"Final position: [{final_pos[0]:.3f}, {final_pos[1]:.3f}, {final_pos[2]:.3f}]")
         print(f"Final position error: {final_error:.4f}")
         print(f"Final FSM state: {info['fsm_state']}")
+        print(f"Final cartesian directions: {info['cartesian_directions']}")
+        print(f"Final speeds - Linear: {info['actual_linear_speed']:.3f}, Angular: {info['actual_angular_speed']:.3f}, Gripper: {info['gripper_speed']:.3f}")
+        print(f"DT ratio (actual_control_time/arm_dt): {info['dt_ratio']}")
+        print(f"Actual control time: {info['actual_control_time']:.3f}s, Inference time: {info['inference_time']:.3f}s")
         print()
         
-        # # Additional example: Demonstrate timeout behavior
-        # print("\n" + "="*60)
-        # print("Additional Example: Demonstrating timeout behavior")
-        # print("="*60)
+        # Additional example: Demonstrate gripper control
+        print("\n" + "="*80)
+        print("Additional Example: Gripper Control")
+        print("="*80)
         
-        # # Use current state (don't reset)
-        # current_position = obs[12:15].copy()
-        # current_orientation = obs[15:19]
+        # Use current state (don't reset)
+        current_position = obs[12:15].copy()
+        current_orientation = obs[15:19]
         
-        # # Try to move to a very far position (likely to timeout)
-        # far_position = current_position + np.array([0.5, 0.5, 0.5])  # Far target
-        # print(f"Attempting to move to far position: {far_position}")
-        # print(f"This will likely timeout after {env.move_timeout} seconds")
+        # Test gripper opening and closing
+        gripper_actions = [
+            ("Open gripper", -1.0),
+            ("Close gripper", 1.0),
+            ("Half open", 0.0)
+        ]
         
-        # action = np.concatenate([far_position, current_orientation, [0]])
-        
-        # # Run for more steps to see timeout behavior
-        # for step in range(100):
-        #     obs, reward, done, info = env.step(action)
+        for gripper_name, gripper_target in gripper_actions:
+            print(f"=== {gripper_name} ===")
             
-        #     if step % 20 == 0:
-        #         print(f"Step {step}: Current position: {obs[12:15]}, Error: {info['position_error']:.4f}, FSM state: {info['fsm_state']}")
+            action = np.concatenate([current_position, current_orientation, [gripper_target]])
             
-        #     # If FSM returned to JOINTCTRL (movement complete or timeout)
-        #     if info['fsm_state'] == 2:  # 2 = JOINTCTRL
-        #         if info['position_error'] > 0.1:
-        #             print(f"Movement timed out at step {step}! FSM returned to JOINTCTRL")
-        #         else:
-        #             print(f"Movement completed at step {step}")
-        #         break
+            # Run for a few steps to see gripper movement
+            for step in range(10):
+                obs, reward, done, info = env.step(action, inference_time)
+                
+                if step % 3 == 0:
+                    print(f"  Step {step}: Gripper position: {obs[19]:.3f}, Target: {gripper_target}")
+                
+                if done:
+                    print(f"  Episode finished during {gripper_name}!")
+                    break
             
-        #     if done:
-        #         print("Episode finished!")
-        #         break
+            print(f"  {gripper_name} completed! Final gripper position: {obs[19]:.3f}")
+            print()
+            
+            if done:
+                break
+            
+            time.sleep(0.5)  # Short delay between gripper actions
         
         print("\nAll examples completed successfully!")
         
@@ -185,35 +207,9 @@ def main():
         print("Environment closed.")
 
 
-def test_environment_basic():
-    """Basic test of the environment functionality."""
-    print("Testing basic environment functionality...")
-    
-    env = EEPoseCtrlWrapper(has_gripper=True)
-    
-    # Test reset
-    obs = env.reset()
-    assert obs.shape == env.observation_space.shape, f"Obs shape mismatch: {obs.shape} vs {env.observation_space.shape}"
-    
-    # Test step
-    action = env.action_space.sample()
-    obs, reward, done, info = env.step(action)
-    
-    assert obs.shape == env.observation_space.shape, "Obs shape mismatch after step"
-    assert isinstance(reward, (int, float)), "Reward should be numeric"
-    assert isinstance(done, bool), "Done should be boolean"
-    assert isinstance(info, dict), "Info should be dictionary"
-    
-    # Test close
-    env.close()
-    
-    print("Basic tests passed!")
 
 
-if __name__ == "__main__":
-    # Run basic tests first
-    # test_environment_basic()
-    # print()
-    
+
+if __name__ == "__main__":    
     # Run main example
     main()
