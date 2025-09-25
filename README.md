@@ -1,6 +1,29 @@
 
 
+# Setup
 
+```bash
+
+cd ~/Workspace/z1_contoller
+mkdir -p build && cd build
+cmake ..
+make -j 
+
+cd ~/Workspace/z1_sdk
+mkdir -p build && cd build
+cmake .. -DPython3_EXECUTABLE=$(which python)
+make -j
+
+# check build
+ls ../lib/unitree_arm_interface*.so
+
+# set python path
+export PYTHONPATH=$PYTHONPATH:$(realpath ../lib)
+or 
+cp ../lib/unitree_arm_interface*.so ../examples_py/
+
+
+```
 # Example
 
 ```bash
