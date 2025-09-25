@@ -129,7 +129,7 @@ class Z1BaseEnv(gym.Env):
     def close(self):
         """Clean up the environment."""
         if self.is_initialized:
-            # Wait for inference thread to finish if running
+            # Wait for inference process to finish if running
             if hasattr(self, 'inference_process') and self.inference_process and self.inference_process.is_alive():
                 print("Waiting for inference process to finish...")
                 self.inference_process.join(timeout=1.0)
@@ -189,10 +189,7 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         # Non-blocking inference system using multiprocessing
         self.action_queue = Queue()
         self.inference_process = None
-        self.inference_function = None
         self.inference_ready = Event()
-        self.inference_result = None
-        self.inference_exception = None
         
         # RTC-style future sequence handling
         self.current_sequence = None  # Current future target pose sequence
@@ -271,7 +268,7 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
             return
         
         # Create a new process for this inference (simpler approach)
-        def _inference_worker(inference_function, action_queue, inference_ready, inference_result, inference_exception):
+        def _inference_worker(inference_function, action_queue, inference_ready):
             """Worker function that runs inference in a separate process."""
             try:
                 # Call the actual inference function
@@ -280,221 +277,26 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
                 real_inference_time = time.time() - start_inference
                 print(f"Inference completed in {real_inference_time:.6f}s, generated sequence shape: {new_sequence.shape}")
 
-                # Store result in shared memory
-                action_bytes = new_sequence.tobytes()
-                for i, byte in enumerate(action_bytes):
-                    if i < len(inference_result):
-                        inference_result[i] = byte
-                # Clear exception
-                for i in range(len(inference_exception)):
-                    inference_exception[i] = b'\x00'
+                # Put result in queue
                 action_queue.put(new_sequence)
                 print(f"Inference completed, new sequence queued with shape: {new_sequence.shape}")
             except Exception as e:
                 print(f"Error in inference function: {e}")
-                error_bytes = str(e).encode()
-                for i, byte in enumerate(error_bytes):
-                    if i < len(inference_exception):
-                        inference_exception[i] = byte
-                # Clear result
-                for i in range(len(inference_result)):
-                    inference_result[i] = b'\x00'
                 # Put a dummy sequence to unblock the system
                 action_queue.put(np.zeros((self.sequence_length, 8)))
             finally:
                 inference_ready.set()
         
-        # Create shared memory for results (larger buffer for sequences)
-        sequence_size = self.sequence_length * 8 * 8  # sequence_length * 8 actions * 8 bytes per float64
-        self.inference_result = mp.Array('c', max(1024, sequence_size))
-        self.inference_exception = mp.Array('c', 1024)  # 1024 bytes buffer
-        
         # Start the inference process
         self.inference_process = Process(
             target=_inference_worker, 
-            args=(inference_function, self.action_queue, self.inference_ready, self.inference_result, self.inference_exception),
+            args=(inference_function, self.action_queue, self.inference_ready),
             daemon=True
         )
         self.inference_process.start()
         
-        # Clear the shared memory arrays
-        for i in range(len(self.inference_result)):
-            self.inference_result[i] = b'\x00'
-        for i in range(len(self.inference_exception)):
-            self.inference_exception[i] = b'\x00'
         
-        print(f"Started non-blocking inference (will complete in {inference_time:.3f}s, computed time is {time.time() - start:.6f}s)")
     
-    def wait_for_inference_and_execute(self) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
-        """
-        Wait for current inference to complete and execute the resulting action.
-        This function blocks until inference is done and then executes the action.
-        
-        Returns:
-            observation: Current observation
-            reward: Reward for this step
-            done: Whether episode is done
-            info: Additional information
-        """
-        if not (self.inference_process and self.inference_process.is_alive()):
-            print("No inference running, returning current state")
-            self._update_state()
-            observation = self._get_observation()
-            reward = self._get_reward()
-            done = self._is_done()
-            info = {
-                'fsm_state': self.arm.getCurrentState(),
-                'target_position': self.target_position.copy(),
-                'target_orientation': self.target_orientation.copy(),
-                'current_ee_pose': self._get_current_ee_pose(),
-                'position_error': np.linalg.norm(self.target_position - self._get_current_ee_position()),
-                'orientation_error': self._quaternion_distance(
-                    self.target_orientation, self._get_current_ee_orientation()
-                ),
-                'cartesian_directions': self.previous_cartesian_directions.copy() if self.has_previous_directions else np.zeros(7),
-                'actual_linear_speed': self.previous_linear_vel if self.has_previous_directions else 0.0,
-                'actual_angular_speed': self.previous_angular_vel if self.has_previous_directions else 0.0,
-                'gripper_speed': 0.0,
-                'dt_ratio': int(self.dt / self.arm._ctrlComp.dt),
-                'new_action_received_during_execution': False,
-                'is_inference_running': False,
-                'action_queue_size': self.action_queue.qsize()
-            }
-            return observation, reward, done, info
-        
-        print("Waiting for inference to complete...")
-        # Wait for inference to complete using the event
-        self.inference_ready.wait()
-        
-        # Check if there was an exception
-        exception_bytes = bytes(self.inference_exception)
-        if exception_bytes and exception_bytes != b'\x00' * len(self.inference_exception):
-            print(f"Inference failed with exception: {exception_bytes.decode()}")
-            # Fallback to current state
-            self._update_state()
-            observation = self._get_observation()
-            reward = self._get_reward()
-            done = self._is_done()
-            info = {
-                'fsm_state': self.arm.getCurrentState(),
-                'target_position': self.target_position.copy(),
-                'target_orientation': self.target_orientation.copy(),
-                'current_ee_pose': self._get_current_ee_pose(),
-                'position_error': np.linalg.norm(self.target_position - self._get_current_ee_position()),
-                'orientation_error': self._quaternion_distance(
-                    self.target_orientation, self._get_current_ee_orientation()
-                ),
-                'cartesian_directions': self.previous_cartesian_directions.copy() if self.has_previous_directions else np.zeros(7),
-                'actual_linear_speed': self.previous_linear_vel if self.has_previous_directions else 0.0,
-                'actual_angular_speed': self.previous_angular_vel if self.has_previous_directions else 0.0,
-                'gripper_speed': 0.0,
-                'dt_ratio': int(self.dt / self.arm._ctrlComp.dt),
-                'new_action_received_during_execution': False,
-                'is_inference_running': False,
-                'action_queue_size': self.action_queue.qsize()
-            }
-            return observation, reward, done, info
-        
-        # Get the sequence from inference result
-        result_bytes = bytes(self.inference_result)
-        if result_bytes and result_bytes != b'\x00' * len(self.inference_result):
-            new_sequence = np.frombuffer(result_bytes, dtype=np.float64)
-            # Reshape to [sequence_length, 8]
-            new_sequence = new_sequence.reshape(-1, 8)
-            print(f"Got sequence from completed inference with shape: {new_sequence.shape}")
-            
-            # Update current sequence and reset index
-            self.current_sequence = new_sequence
-            self.sequence_index = 0
-            self.sequence_step_count = 0
-            
-            # Update target pose from first action in sequence
-            self.target_position = new_sequence[0, :3]
-            self.target_orientation = self._normalize_quaternion(new_sequence[0, 3:7])
-            if self.has_gripper:
-                self.target_gripper = new_sequence[0, 7]
-            
-            # Get current state and calculate directions
-            self._update_state()
-            current_ee_pose = self._get_current_ee_pose()
-            current_pos = current_ee_pose[:3]
-            current_quat = current_ee_pose[3:7]
-            current_gripper_pos = current_ee_pose[7] if self.has_gripper else 0.0
-            
-            # Calculate cartesian directions for full dt
-            cartesian_directions, actual_linear_speed, actual_angular_speed, gripper_speed = \
-                self._calculate_cartesian_directions(
-                    self.target_position, self.target_orientation, self.target_gripper,
-                    current_pos, current_quat, current_gripper_pos, self.dt
-                )
-            
-            # Execute cartesianCtrlCmd for full dt
-            dt_ratio = int(self.dt / self.arm._ctrlComp.dt)
-            for i in range(dt_ratio):
-                self.arm.cartesianCtrlCmd(cartesian_directions, self.angular_vel, self.linear_vel)
-                time.sleep(self.arm._ctrlComp.dt)
-            
-            # Store current directions for next step
-            self.previous_cartesian_directions = cartesian_directions.copy()
-            self.previous_angular_vel = self.angular_vel
-            self.previous_linear_vel = self.linear_vel
-            self.has_previous_directions = True
-            
-            # Update state and get results
-            self._update_state()
-            observation = self._get_observation()
-            reward = self._get_reward()
-            done = self._is_done()
-            
-            # Create info dictionary
-            info = {
-                'fsm_state': self.arm.getCurrentState(),
-                'target_position': self.target_position.copy(),
-                'target_orientation': self.target_orientation.copy(),
-                'current_ee_pose': self._get_current_ee_pose(),
-                'position_error': np.linalg.norm(self.target_position - self._get_current_ee_position()),
-                'orientation_error': self._quaternion_distance(
-                    self.target_orientation, self._get_current_ee_orientation()
-                ),
-                'cartesian_directions': cartesian_directions.copy(),
-                'actual_linear_speed': actual_linear_speed,
-                'actual_angular_speed': actual_angular_speed,
-                'gripper_speed': gripper_speed,
-                'dt_ratio': dt_ratio,
-                'new_action_received_during_execution': True,
-                'is_inference_running': False,
-                'action_queue_size': self.action_queue.qsize()
-            }
-            
-            self.episode_step += 1
-            return observation, reward, done, info
-            
-        else:
-            print("No action available from inference result")
-            # Fallback to current state
-            self._update_state()
-            observation = self._get_observation()
-            reward = self._get_reward()
-            done = self._is_done()
-            info = {
-                'fsm_state': self.arm.getCurrentState(),
-                'target_position': self.target_position.copy(),
-                'target_orientation': self.target_orientation.copy(),
-                'current_ee_pose': self._get_current_ee_pose(),
-                'position_error': np.linalg.norm(self.target_position - self._get_current_ee_position()),
-                'orientation_error': self._quaternion_distance(
-                    self.target_orientation, self._get_current_ee_orientation()
-                ),
-                'cartesian_directions': self.previous_cartesian_directions.copy() if self.has_previous_directions else np.zeros(7),
-                'actual_linear_speed': self.previous_linear_vel if self.has_previous_directions else 0.0,
-                'actual_angular_speed': self.previous_angular_vel if self.has_previous_directions else 0.0,
-                'gripper_speed': 0.0,
-                'dt_ratio': int(self.dt / self.arm._ctrlComp.dt),
-                'new_action_received_during_execution': False,
-                'is_inference_running': False,
-                'action_queue_size': self.action_queue.qsize()
-            }
-            return observation, reward, done, info
     
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         """
@@ -839,68 +641,3 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         return cartesian_directions, actual_linear_speed, actual_angular_speed, gripper_speed
     
     
-    def _handle_new_sequence_during_execution(self, new_sequence, current_iteration, total_iterations):
-        """
-        Handle new sequence received during cartesianCtrlCmd execution.
-        Implements RTC-style sequence switching by skipping past poses.
-        
-        Args:
-            new_sequence: New sequence received from inference [sequence_length, 8]
-            current_iteration: Current iteration in the control loop
-            total_iterations: Total iterations in the control loop
-        """
-        print(f"RTC: New sequence received during execution at iteration {current_iteration}/{total_iterations}")
-        
-        # Calculate how many steps have already passed in this control cycle
-        # This represents the "inference delay" in RTC terms
-        steps_passed = current_iteration
-        
-        # RTC approach: skip past poses and start from appropriate index
-        # The new sequence should account for the fact that some steps have already passed
-        if steps_passed < len(new_sequence):
-            # Start from the step that corresponds to current time
-            self.current_sequence = new_sequence
-            self.sequence_index = steps_passed
-            self.sequence_step_count = 0
-            
-            # Update target from the appropriate index in new sequence
-            self.target_position = new_sequence[steps_passed, :3]
-            self.target_orientation = self._normalize_quaternion(new_sequence[steps_passed, 3:7])
-            if self.has_gripper:
-                self.target_gripper = new_sequence[steps_passed, 7]
-            
-            print(f"RTC: Switched to new sequence, starting from index {steps_passed} (skipped {steps_passed} past poses)")
-        else:
-            # All poses in new sequence are in the past, use the last one
-            self.current_sequence = new_sequence
-            self.sequence_index = len(new_sequence) - 1
-            self.sequence_step_count = 0
-            
-            # Update target from the last pose in sequence
-            self.target_position = new_sequence[-1, :3]
-            self.target_orientation = self._normalize_quaternion(new_sequence[-1, 3:7])
-            if self.has_gripper:
-                self.target_gripper = new_sequence[-1, 7]
-            
-            print(f"RTC: All poses in new sequence are past, using last pose (index {len(new_sequence)-1})")
-        
-        # Recalculate cartesian directions with new target
-        self._update_state()
-        current_ee_pose = self._get_current_ee_pose()
-        current_pos = current_ee_pose[:3]
-        current_quat = current_ee_pose[3:7]
-        current_gripper_pos = current_ee_pose[7] if self.has_gripper else 0.0
-        
-        # Calculate remaining time for this step
-        remaining_iterations = total_iterations - current_iteration
-        remaining_time = remaining_iterations * self.arm._ctrlComp.dt
-        
-        # Recalculate directions for remaining time
-        cartesian_directions, actual_linear_speed, actual_angular_speed, gripper_speed = \
-            self._calculate_cartesian_directions(
-                self.target_position, self.target_orientation, self.target_gripper,
-                current_pos, current_quat, current_gripper_pos, remaining_time
-            )
-        
-        print(f"RTC: Updated cartesian directions for remaining {remaining_time:.3f}s")
-        return cartesian_directions, actual_linear_speed, actual_angular_speed, gripper_speed

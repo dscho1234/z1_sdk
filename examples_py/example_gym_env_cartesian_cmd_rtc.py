@@ -89,8 +89,12 @@ def generate_square_sequence(base_position, base_orientation, base_gripper, squa
         # Orientation: keep base orientation
         new_orientation = base_orientation.copy()
         
-        # Gripper: keep base gripper position
-        new_gripper = base_gripper
+        # Gripper: alternate between open and close for each edge
+        # Edge 0: open (1), Edge 1: close (-1), Edge 2: open (1), Edge 3: close (-1)
+        if edge_index % 2 == 0:
+            new_gripper = 1.0  # Open
+        else:
+            new_gripper = -1.0  # Close
         
         # Combine into action
         sequence[i] = np.concatenate([target_position, new_orientation, [new_gripper]])
@@ -125,23 +129,19 @@ def main():
     try:
         # Reset the environment
         print("Resetting environment...")
-        try:
-            obs = env.reset()
-            print(f"Initial observation shape: {obs.shape}")
-            print(f"Initial joint positions: {obs[:6]}")
-            print(f"Initial end-effector position: {obs[12:15]}")
-            print(f"Initial end-effector orientation: {obs[15:19]}")
-            print(f"Initial gripper position: {obs[19]}")
-            print()
-        except Exception as e:
-            print(f"Error during reset: {e}")
-            import traceback
-            traceback.print_exc()
-            return
+        obs = env.reset()
+        print(f"Initial observation shape: {obs.shape}")
+        print(f"Initial joint positions: {obs[:6]}")
+        print(f"Initial end-effector position: {obs[12:15]}")
+        print(f"Initial end-effector orientation: {obs[15:19]}")
+        print(f"Initial gripper position: {obs[19]}")
+        print()
+    
         
         # Example: RTC-style future sequence handling with square movement
         print("Example: RTC-style future sequence handling with square movement")
         print("Using non_blocking_inference for future target pose sequences")
+        print("Gripper will alternate between open and close for each edge")
         print(f"Control frequency: {control_frequency} Hz")
         print(f"Angular velocity limit: {env.angular_vel} rad/s")
         print(f"Linear velocity limit: {env.linear_vel} m/s")
@@ -170,12 +170,13 @@ def main():
         
         print("Square movement plan:")
         for i, vertex in enumerate(square_vertices):
-            print(f"  Vertex {i}: {vertex}")
+            gripper_state = "Open" if i % 2 == 0 else "Close"
+            print(f"  Vertex {i}: {vertex} (Gripper: {gripper_state})")
         print()
 
-        # Run for a fixed number of steps to demonstrate RTC behavior
-        total_steps = 30
         
+        total_steps = 30
+
         
         # Generate the first target sequence
         target_sequence = generate_square_sequence(
@@ -197,58 +198,54 @@ def main():
         
         # Track inference delay (steps passed during inference)
         inference_start_step = 0
-        inference_running = False
+        
+        # Track errors for average calculation
+        position_errors = []
+        orientation_errors = []
         
         # Start first inference
         inference_func = create_inference_function(target_sequence, inference_time)
         env.non_blocking_inference(inference_func, inference_time)
-        inference_running = True
         inference_start_step = 0
         
         for step in range(total_steps):
             # Check if inference is complete and get new sequence
-            if inference_running and not (env.inference_process and env.inference_process.is_alive()):
+            if not (env.inference_process and env.inference_process.is_alive()):
                 # Inference completed, get new sequence
-                try:
-                    new_sequence = env.action_queue.get_nowait()
-                    inference_delay = step - inference_start_step
-                    
-                    print(f"RTC: Inference completed at step {step}, delay was {inference_delay} steps")
-                    print(f"RTC: New sequence shape: {new_sequence.shape}")
-                    
-                    # RTC-style sequence switching: skip past poses
-                    if inference_delay < len(new_sequence):
-                        start_index = inference_delay
-                        print(f"RTC: Starting from index {start_index} (skipped {inference_delay} past poses)")
-                    else:
-                        start_index = len(new_sequence) - 1
-                        print(f"RTC: All poses are past, using last pose (index {start_index})")
-                    
-                    # Set new sequence with appropriate start index
-                    env.set_current_sequence(new_sequence, start_index)
-                    current_sequence = new_sequence
-                    inference_running = False
-                    
-                    # Immediately start new inference after getting the result
-                    current_pos = obs[12:15] if 'obs' in locals() else original_position
-                    current_orient = obs[15:19] if 'obs' in locals() else current_orientation
-                    
-                    # Generate new target sequence starting from current step
-                    new_target_sequence = generate_square_sequence(
-                        current_pos, current_orient, target_gripper, square_vertices, total_steps, step, sequence_length
-                    )
-                    
-                    # Start new inference immediately
-                    inference_func = create_inference_function(new_target_sequence, inference_time)
-                    env.non_blocking_inference(inference_func, inference_time)
-                    inference_running = True
-                    inference_start_step = step
-                    print(f"RTC: Started new inference immediately at step {step}")
-                    
-                except:
-                    print("RTC: No new sequence available from completed inference")
-                    inference_running = False
-            
+                
+                new_sequence = env.action_queue.get_nowait()
+                inference_delay = step - inference_start_step
+                
+                print(f"RTC: Inference completed at step {step}, delay was {inference_delay} steps")
+                print(f"RTC: New sequence shape: {new_sequence.shape}")
+                
+                # RTC-style sequence switching: skip past poses
+                if inference_delay < len(new_sequence):
+                    start_index = inference_delay
+                    print(f"RTC: Starting from index {start_index} (skipped {inference_delay} past poses)")
+                else:
+                    start_index = len(new_sequence) - 1
+                    print(f"RTC: All poses are past, using last pose (index {start_index})")
+                
+                # Set new sequence with appropriate start index
+                env.set_current_sequence(new_sequence, start_index)
+                current_sequence = new_sequence
+                
+                # Immediately start new inference after getting the result
+                current_pos = obs[12:15] if 'obs' in locals() else original_position
+                current_orient = obs[15:19] if 'obs' in locals() else current_orientation
+                
+                # Generate new target sequence starting from current step
+                new_target_sequence = generate_square_sequence(
+                    current_pos, current_orient, target_gripper, square_vertices, total_steps, step, sequence_length
+                )
+                
+                # Start new inference immediately
+                inference_func = create_inference_function(new_target_sequence, inference_time)
+                env.non_blocking_inference(inference_func, inference_time)
+                inference_start_step = step
+                print(f"RTC: Started new inference immediately at step {step}")
+                
             # Get next action from current sequence
             action = env.get_next_action_from_sequence()
             if action is None:
@@ -262,17 +259,11 @@ def main():
             # Execute step with the action
             obs, reward, done, info = env.step(action)
             
-            # Print progress every 5 steps
-            if step % 5 == 0:
-                current_pos = obs[12:15]
-                position_error = info['position_error']
-                sequence_index = env.sequence_index
-                sequence_length_current = len(env.current_sequence) if env.current_sequence is not None else 0
-                
-                print(f"Step {step:3d}: Current pos: [{current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}], "
-                      f"Error: {position_error:.4f}")
-                print(f"         Sequence index: {sequence_index}/{sequence_length_current-1}, "
-                      f"Inference running: {inference_running}")
+            # Collect errors for average calculation
+            position_errors.append(info['position_error'])
+            orientation_errors.append(info['orientation_error'])
+            
+            
             
             if done:
                 print(f"Episode finished at step {step}!")
@@ -290,8 +281,17 @@ def main():
         print(f"DT ratio (actual_control_time/arm_dt): {info['dt_ratio']}")
         print(f"Final sequence index: {env.sequence_index}")
         print(f"Final sequence length: {len(env.current_sequence) if env.current_sequence is not None else 0}")
-        print()
         
+        # Calculate and print average errors
+        if position_errors:
+            avg_position_error = np.mean(position_errors)
+            avg_orientation_error = np.mean(orientation_errors)
+            print(f"\nAverage Errors:")
+            print(f"  Average position error: {avg_position_error:.4f} m")
+            print(f"  Average orientation error: {avg_orientation_error:.4f} rad")
+            print(f"  Total steps executed: {len(position_errors)}")
+        
+        print()
         print("\nRTC-style square movement with proper sequence handling completed successfully!")
         
     except KeyboardInterrupt:
