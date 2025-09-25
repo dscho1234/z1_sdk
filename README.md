@@ -1,7 +1,20 @@
-# Z1_SDK
 
-documentation
 
-[unitree-z1-docs-english](https://support.unitree.com/home/en/Z1_developer)
 
-[unitree-z1-docs-chinese](https://support.unitree.com/home/zh/Z1_developer)
+# Example
+
+```bash
+
+cd ~/Workspace/z1_contoller/build
+./z1_ctrl
+
+
+cd ~/Workspace/z1_sdk
+# Action chunking
+python examples_py/example_gym_env_cartesian_cmd_rtc.py 
+
+# image, robot joint data collection
+python examples_py/example_free_drive.py
+
+```
+
