@@ -11,6 +11,7 @@ import sys
 import os
 import numpy as np
 import time
+from scipy.spatial.transform import Rotation as R
 
 # Add the envs directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "envs"))
@@ -42,7 +43,7 @@ def create_inference_function(target_sequence, inference_time=0.15):
     return inference_function
 
 
-def generate_square_sequence(base_position, base_orientation, base_gripper, square_vertices, total_steps, current_step, sequence_length=10):
+def generate_square_sequence(base_position, base_orientation, base_gripper, square_vertices, orientation_vertices, total_steps, current_step, sequence_length=10):
     """
     Generate a target pose sequence that follows the square path.
     The square path is divided into total_steps, and we return sequence_length steps starting from current_step.
@@ -52,6 +53,7 @@ def generate_square_sequence(base_position, base_orientation, base_gripper, squa
         base_orientation: Base orientation to use
         base_gripper: Base gripper position to use
         square_vertices: List of square vertices defining the path
+        orientation_vertices: List of orientations for each vertex
         total_steps: Total number of steps for the entire square path
         current_step: Current step to start the sequence from
         sequence_length: Length of target pose sequence to generate
@@ -86,8 +88,20 @@ def generate_square_sequence(base_position, base_orientation, base_gripper, squa
         t = step_in_edge / steps_per_edge
         target_position = start_vertex + t * (end_vertex - start_vertex)
         
-        # Orientation: keep base orientation
-        new_orientation = base_orientation.copy()
+        # Interpolate orientation along the edge
+        start_orientation = orientation_vertices[edge_index]
+        end_orientation = orientation_vertices[edge_index + 1]
+        
+        # Use SLERP (Spherical Linear Interpolation) for proper quaternion interpolation
+        start_rot = R.from_quat(start_orientation)
+        end_rot = R.from_quat(end_orientation)
+        
+        # Create a rotation that represents the interpolation
+        # This uses scipy's built-in SLERP functionality
+        new_rot = start_rot * (start_rot.inv() * end_rot) ** t
+        
+        # Convert back to quaternion
+        new_orientation = new_rot.as_quat()
         
         # Gripper: alternate between open and close for each edge
         # Edge 0: open (1), Edge 1: close (-1), Edge 2: open (1), Edge 3: close (-1)
@@ -108,7 +122,7 @@ def main():
     print("=" * 80)
     
     # Create the environment with 5Hz control frequency
-    control_frequency = 10 # 5
+    control_frequency = 5
     inference_time = 0.15  # Neural network inference time
     sequence_length = 16   # Length of future target pose sequences
     
@@ -117,7 +131,7 @@ def main():
         control_frequency=control_frequency,  # 5Hz control frequency
         position_tolerance=0.01,
         orientation_tolerance=0.1,
-        angular_vel=0.3,  # Angular velocity limit
+        angular_vel=1.0,  # Angular velocity limit
         linear_vel=0.3,   # Linear velocity limit
         sequence_length=sequence_length,  # Length of future sequences from inference
     )
@@ -142,6 +156,7 @@ def main():
         print("Example: RTC-style future sequence handling with square movement")
         print("Using non_blocking_inference for future target pose sequences")
         print("Gripper will alternate between open and close for each edge")
+        print("Orientation will change roll: 0°, +90°, 0°, -90°, 0° for each edge")
         print(f"Control frequency: {control_frequency} Hz")
         print(f"Angular velocity limit: {env.angular_vel} rad/s")
         print(f"Linear velocity limit: {env.linear_vel} m/s")
@@ -168,6 +183,17 @@ def main():
             original_position + np.array([0.0, 0.0, 0.0])            # Back to start
         ]
         
+        # Define orientation vertices with roll changes: 0°, +90°, 0°, -90°, 0°
+        roll_angles = [0, np.pi/4, 0, -np.pi/4, 0]  # 0°, +90°, 0°, -90°, 0°
+        orientation_vertices = []
+        
+        for roll_angle in roll_angles:
+            # Convert base orientation (quaternion) to rotation matrix, apply roll, convert back
+            base_rot = R.from_quat(current_orientation)
+            roll_rot = R.from_euler('x', roll_angle)
+            new_rot = base_rot * roll_rot
+            orientation_vertices.append(new_rot.as_quat())
+        
         print("Square movement plan:")
         for i, vertex in enumerate(square_vertices):
             gripper_state = "Open" if i % 2 == 0 else "Close"
@@ -180,7 +206,7 @@ def main():
         
         # Generate the first target sequence
         target_sequence = generate_square_sequence(
-            original_position, current_orientation, target_gripper, square_vertices, total_steps, 0, sequence_length
+            original_position, current_orientation, target_gripper, square_vertices, orientation_vertices, total_steps, 0, sequence_length
         )
         print(f"Generated first target sequence with shape: {target_sequence.shape}")
         print()
@@ -237,7 +263,7 @@ def main():
                 
                 # Generate new target sequence starting from current step
                 new_target_sequence = generate_square_sequence(
-                    current_pos, current_orient, target_gripper, square_vertices, total_steps, step, sequence_length
+                    current_pos, current_orient, target_gripper, square_vertices, orientation_vertices, total_steps, step, sequence_length
                 )
                 
                 # Start new inference immediately
