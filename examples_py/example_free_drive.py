@@ -23,6 +23,7 @@ import time
 import pickle
 import numpy as np
 import cv2
+from datetime import datetime
 
 # Add the lib directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "lib"))
@@ -41,16 +42,18 @@ np.set_printoptions(precision=3, suppress=True)
 class FreeDriveDataCollector:
     """Data collector for free drive mode with camera and robot data collection."""
     
-    def __init__(self, output_dir="free_drive_data", has_gripper=True):
+    def __init__(self, output_dir="free_drive_data", has_gripper=True, resolution="HD"):
         """
         Initialize the data collector.
         
         Args:
             output_dir: Directory to save collected data
             has_gripper: Whether the robot has a gripper
+            resolution: Camera resolution ("VGA", "HD", "FHD")
         """
         self.output_dir = output_dir
         self.has_gripper = has_gripper
+        self.resolution = resolution
         
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
@@ -68,7 +71,7 @@ class FreeDriveDataCollector:
             self._init_camera()
         
         # Data collection parameters
-        self.collection_steps = 10
+        
         self.step_delay = 0.1  # 100ms between steps
         self.warmup_steps = 30  # Warmup steps (data collected but not saved)
         
@@ -82,12 +85,13 @@ class FreeDriveDataCollector:
         self.ee_rotation_matrices_data = []
         self.T_matrices_data = []
         self.timestamps_data = []
+        self.images_data = []  # Store images in memory for batch saving
         
         print(f"Data collector initialized. Output directory: {output_dir}")
         print(f"Camera available: {self.camera_available}")
+        print(f"Camera resolution: {self.resolution}")
         print(f"Warmup steps: {self.warmup_steps}")
-        print(f"Collection steps: {self.collection_steps}")
-    
+        
     def _init_camera(self):
         """Initialize RealSense D435 camera."""
         try:
@@ -95,17 +99,120 @@ class FreeDriveDataCollector:
             self.pipeline = rs.pipeline()
             config = rs.config()
             
+            # Get resolution settings based on resolution parameter
+            width, height, fps = self._get_resolution_settings()
+            
             # Configure color stream
-            config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
             
             # Start streaming
             self.pipeline.start(config)
             self.camera_available = True
-            print("RealSense D435 camera initialized successfully.")
+            print(f"RealSense D435 camera initialized successfully with {width}x{height} @ {fps}fps.")
+            
+            # Configure camera settings (disable auto exposure and auto focus)
+            self._configure_camera_settings()
+            
+            # Get camera intrinsic parameters
+            self._print_camera_intrinsics()
             
         except Exception as e:
             print(f"Failed to initialize camera: {e}")
             self.camera_available = False
+    
+    def _configure_camera_settings(self):
+        """Configure camera settings to disable auto exposure and auto focus."""
+        try:
+            # Get the active profile and device
+            profile = self.pipeline.get_active_profile()
+            device = profile.get_device()
+            
+            # Get color sensor (usually the second sensor)
+            sensors = device.query_sensors()
+            color_sensor = None
+            for sensor in sensors:
+                if sensor.get_info(rs.camera_info.name) == 'RGB Camera':
+                    color_sensor = sensor
+                    break
+            
+            if color_sensor is not None:
+                print("Configuring camera settings...")
+                
+                # Disable auto exposure
+                if color_sensor.supports(rs.option.enable_auto_exposure):
+                    color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+                    print("  - Auto exposure disabled")
+                
+                # Set manual exposure (adjust this value based on your lighting conditions)
+                if color_sensor.supports(rs.option.exposure):
+                    exposure_value = 166  # Default exposure in milliseconds
+                    color_sensor.set_option(rs.option.exposure, exposure_value)
+                    print(f"  - Manual exposure set to {exposure_value}ms")
+                
+                # Disable auto white balance
+                if color_sensor.supports(rs.option.enable_auto_white_balance):
+                    color_sensor.set_option(rs.option.enable_auto_white_balance, 0)
+                    print("  - Auto white balance disabled")
+                
+                # Set manual white balance (adjust based on your lighting)
+                if color_sensor.supports(rs.option.white_balance):
+                    white_balance_value = 3000  # Default white balance (Kelvin)
+                    color_sensor.set_option(rs.option.white_balance, white_balance_value)
+                    print(f"  - Manual white balance set to {white_balance_value}K")
+                
+                # Set brightness
+                if color_sensor.supports(rs.option.brightness):
+                    brightness_value = 0  # Default brightness
+                    color_sensor.set_option(rs.option.brightness, brightness_value)
+                    print(f"  - Brightness set to {brightness_value}")
+                
+                # Set contrast
+                if color_sensor.supports(rs.option.contrast):
+                    contrast_value = 50  # Default contrast
+                    color_sensor.set_option(rs.option.contrast, contrast_value)
+                    print(f"  - Contrast set to {contrast_value}")
+                
+                print("Camera settings configured successfully.")
+            else:
+                print("Warning: Could not find RGB camera sensor for configuration.")
+                
+        except Exception as e:
+            print(f"Warning: Failed to configure camera settings: {e}")
+            print("Camera will use default auto settings.")
+    
+    def _get_resolution_settings(self):
+        """Get camera resolution settings based on resolution parameter."""
+        resolution_settings = {
+            "VGA": (640, 480, 30),    # VGA resolution
+            "HD": (1280, 720, 30),    # HD resolution  
+            "FHD": (1920, 1080, 30)   # Full HD resolution
+        }
+        
+        if self.resolution in resolution_settings:
+            return resolution_settings[self.resolution]
+        else:
+            print(f"Unknown resolution '{self.resolution}', using HD as default.")
+            return resolution_settings["HD"]
+    
+    def _print_camera_intrinsics(self):
+        """Print camera intrinsic parameters."""
+        try:
+            # Get the active profile and color stream
+            profile = self.pipeline.get_active_profile()
+            color_stream = profile.get_stream(rs.stream.color)
+            intrinsics = color_stream.as_video_stream_profile().get_intrinsics()
+            
+            print("\n=== Camera Intrinsic Parameters ===")
+            print(f"Width: {intrinsics.width}")
+            print(f"Height: {intrinsics.height}")
+            print(f"Focal Length (fx, fy): ({intrinsics.fx:.2f}, {intrinsics.fy:.2f})")
+            print(f"Principal Point (cx, cy): ({intrinsics.ppx:.2f}, {intrinsics.ppy:.2f})")
+            print(f"Distortion Model: {intrinsics.model}")
+            print(f"Distortion Coefficients: {intrinsics.coeffs}")
+            print("=====================================\n")
+            
+        except Exception as e:
+            print(f"Failed to get camera intrinsics: {e}")
     
     
     def _capture_image(self):
@@ -129,11 +236,115 @@ class FreeDriveDataCollector:
             print(f"Error capturing image: {e}")
             return None
     
+    def _show_streaming_window(self):
+        """Show real-time camera streaming window."""
+        if not self.camera_available:
+            print("Camera not available for streaming.")
+            return
+        
+        print("Starting camera streaming...")
+        print("Press 'q' to quit streaming and continue with data collection.")
+        print("Press 'c' to capture current frame for data collection.")
+        print("Make sure the camera window is focused for keyboard input to work.")
+        
+        # Create a named window first
+        cv2.namedWindow('Camera Stream - Press q to quit, c to capture', cv2.WINDOW_AUTOSIZE)
+        
+        try:
+            while True:
+                # Capture image
+                image = self._capture_image()
+                if image is not None:
+                    # Get robot state for real-time display
+                    robot_state = self._get_robot_state()
+                    
+                    # Add text overlay
+                    display_image = image.copy()
+                    cv2.putText(display_image, "Press 'q' to quit, 'c' to capture", 
+                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(display_image, f"Images collected: {len(self.images_data)}", 
+                              (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    
+                    # Add real-time robot state info to image
+                    if robot_state is not None:
+                        joint_angles = robot_state['joint_angles']
+                        ee_pos = robot_state['ee_position']
+                        ee_quat = robot_state['ee_quaternion']
+                        se3_transform = robot_state['T']
+                        
+                        # Display joint angles
+                        cv2.putText(display_image, f"Joint: [{joint_angles[0]:.3f}, {joint_angles[1]:.3f}, {joint_angles[2]:.3f}]", 
+                                  (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                        cv2.putText(display_image, f"      [{joint_angles[3]:.3f}, {joint_angles[4]:.3f}, {joint_angles[5]:.3f}]", 
+                                  (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                        
+                        # Display end effector position
+                        cv2.putText(display_image, f"EE Pos: [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]", 
+                                  (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                        
+                        # Display end effector quaternion
+                        cv2.putText(display_image, f"EE Quat: [{ee_quat[0]:.3f}, {ee_quat[1]:.3f}, {ee_quat[2]:.3f}, {ee_quat[3]:.3f}]", 
+                                  (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                        
+                        # Display SE3 transform
+                        cv2.putText(display_image, f"SE3 Transform: [{se3_transform[0, 0]:.3f}, {se3_transform[0, 1]:.3f}, {se3_transform[0, 2]:.3f}, {se3_transform[0, 3]:.3f}]", 
+                                  (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                        cv2.putText(display_image, f"               [{se3_transform[1, 0]:.3f}, {se3_transform[1, 1]:.3f}, {se3_transform[1, 2]:.3f}, {se3_transform[1, 3]:.3f}]", 
+                                  (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                        cv2.putText(display_image, f"               [{se3_transform[2, 0]:.3f}, {se3_transform[2, 1]:.3f}, {se3_transform[2, 2]:.3f}, {se3_transform[2, 3]:.3f}]", 
+                                  (10, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                        cv2.putText(display_image, f"               [{se3_transform[3, 0]:.3f}, {se3_transform[3, 1]:.3f}, {se3_transform[3, 2]:.3f}, {se3_transform[3, 3]:.3f}]", 
+                                  (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    else:
+                        cv2.putText(display_image, "Robot state unavailable", 
+                                  (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                    
+                    # Show image
+                    cv2.imshow('Camera Stream - Press q to quit, c to capture', display_image)
+                    
+                    # Check for key press with longer wait time
+                    key = cv2.waitKey(30) & 0xFF
+                    if key == ord('q') or key == 27:  # 'q' or ESC key
+                        print("\nQuitting streaming window...")
+                        break
+                    elif key == ord('c'):
+                        # Capture current frame
+                        print(f"\nCapturing frame {len(self.images_data) + 1}...")
+                        if robot_state is not None:
+                            image_stored = self._store_image(image)
+                            data_stored = self._store_robot_data(robot_state)
+                            
+                            if image_stored and data_stored:
+                                print(f"✓ Frame captured successfully! Total: {len(self.images_data)}")
+                                # Print robot state info
+                                joint_angles = robot_state['joint_angles']
+                                ee_pos = robot_state['ee_position']
+                                print(f"  Joint Angles: [{joint_angles[0]:.3f}, {joint_angles[1]:.3f}, {joint_angles[2]:.3f}, {joint_angles[3]:.3f}, {joint_angles[4]:.3f}, {joint_angles[5]:.3f}]")
+                                print(f"  EE Position: [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]")
+                            else:
+                                print("✗ Failed to capture frame")
+                                if not image_stored:
+                                    print("  - Image storage failed")
+                                if not data_stored:
+                                    print("  - Robot data storage failed")
+                        else:
+                            print("✗ Failed to get robot state")
+                else:
+                    print("Failed to capture image")
+                    time.sleep(0.1)
+                    
+        except KeyboardInterrupt:
+            print("\nStreaming interrupted by user.")
+        finally:
+            cv2.destroyAllWindows()
+            print("Streaming window closed.")
+    
     
     def _get_robot_state(self):
         """Get current robot state including joint angles and end-effector pose."""
         try:
-            # Get joint angles
+            # Simply read the current state without sending any commands
+            # This should work if the robot is in free drive mode (loopOff)
             joint_angles = np.array(self.arm.lowstate.getQ())
             joint_velocities = np.array(self.arm.lowstate.getQd())
             
@@ -197,16 +408,23 @@ class FreeDriveDataCollector:
         
         return np.array([qw, qx, qy, qz])
     
-    def _save_image(self, step, image):
-        """Save image for one step."""
+    def _store_image(self, image):
+        """Store image in memory for batch saving."""
         try:
             if image is not None:
-                image_path = os.path.join(self.output_dir, "images", f"image_{step:04d}.png")
-                cv2.imwrite(image_path, image)
-                return True
-            return False
+                # Check if image has valid dimensions
+                if len(image.shape) == 3 and image.shape[2] == 3:
+                    self.images_data.append(image.copy())
+                    print(f"Image stored successfully. Shape: {image.shape}")
+                    return True
+                else:
+                    print(f"Invalid image shape: {image.shape}")
+                    return False
+            else:
+                print("Image is None, cannot store")
+                return False
         except Exception as e:
-            print(f"Error saving image for step {step}: {e}")
+            print(f"Error storing image: {e}")
             return False
     
     def _store_robot_data(self, robot_state):
@@ -229,7 +447,7 @@ class FreeDriveDataCollector:
             return False
     
     def _save_all_data(self):
-        """Save all collected robot data as numpy arrays in a single pkl file."""
+        """Save all collected robot data and images."""
         try:
             # Convert lists to numpy arrays
             data_dict = {
@@ -245,7 +463,7 @@ class FreeDriveDataCollector:
                 'collection_steps': len(self.joint_angles_data)
             }
             
-            # Save to single pkl file
+            # Save robot data to pkl file
             data_path = os.path.join(self.output_dir, "robot_data.pkl")
             with open(data_path, 'wb') as f:
                 pickle.dump(data_dict, f)
@@ -256,49 +474,48 @@ class FreeDriveDataCollector:
                 if key != 'collection_steps':
                     print(f"  {key}: {value.shape}")
             
+            # Save all images at once
+            if self.images_data:
+                print("Saving images...")
+                images_saved = 0
+                for i, image in enumerate(self.images_data):
+                    if image is not None:
+                        os.makedirs(os.path.join(self.output_dir, "images"), exist_ok=True)
+                        image_path = os.path.join(self.output_dir, "images", f"image_{i:04d}.png")
+                        success = cv2.imwrite(image_path, image)
+                        if success:
+                            images_saved += 1
+                        else:
+                            print(f"Warning: Failed to save image {i}")
+                    else:
+                        print(f"Warning: Image {i} is None, skipping...")
+                print(f"Saved {images_saved}/{len(self.images_data)} images to: {os.path.join(self.output_dir, 'images')}")
+            else:
+                print("No images to save.")
+            
             return True
             
         except Exception as e:
-            print(f"Error saving all robot data: {e}")
+            print(f"Error saving all data: {e}")
             return False
     
     def enable_free_drive_mode(self):
-        """Enable free drive mode by setting low-level commands with zero torque."""
+        """Enable free drive mode by completely turning off robot control."""
         print("Enabling free drive mode...")
         
-        # Set FSM to low-level command mode
-        self.arm.setFsmLowcmd()
-        
-        # Get current joint positions
-        current_q = np.array(self.arm.lowstate.getQ())
-        current_qd = np.zeros(6)  # Zero velocity
-        current_tau = np.zeros(6)  # Zero torque for free drive
-        
-        # Set gripper commands
-        if self.has_gripper:
-            current_gripper_q = self.arm.lowstate.getGripperQ()
-            current_gripper_qd = 0.0
-            current_gripper_tau = 0.0
-        else:
-            current_gripper_q = 0.0
-            current_gripper_qd = 0.0
-            current_gripper_tau = 0.0
-        
-        # Send commands
-        self.arm.setArmCmd(current_q, current_qd, current_tau)
-        if self.has_gripper:
-            self.arm.setGripperCmd(current_gripper_q, current_gripper_qd, current_gripper_tau)
-        self.arm.sendRecv()
+        # Turn off the control loop completely
+        self.arm.loopOn()
         
         print("Free drive mode enabled. You can now manually move the robot arm.")
-        print("The robot will maintain its current position with zero torque.")
+        print("Robot control is completely disabled - no resistance to manual movement.")
+    
     
     def disable_free_drive_mode(self):
         """Disable free drive mode and return to normal control."""
         print("Disabling free drive mode...")
         
         # Return to normal control mode
-        self.arm.loopOn()
+        # self.arm.loopOn()
         self.arm.backToStart()
         self.arm.loopOff()
         
@@ -306,66 +523,62 @@ class FreeDriveDataCollector:
     
     def collect_data(self):
         """Main data collection loop."""
-        total_steps = self.warmup_steps + self.collection_steps
         print(f"\nStarting data collection...")
         print(f"Warmup steps: {self.warmup_steps} (data collected but not saved)")
-        print(f"Collection steps: {self.collection_steps} (data saved)")
-        print(f"Total steps: {total_steps}")
         print("Move the robot arm manually to different positions to collect diverse data.")
         print("Press Ctrl+C to stop collection early.\n")
         
         successful_steps = 0
         
         try:
-            for step in range(total_steps):
-                is_warmup = step < self.warmup_steps
-                step_type = "Warmup" if is_warmup else "Collection"
+            # Warmup phase - continuous data collection without saving
+            print("=== WARMUP PHASE ===")
+            for step in range(self.warmup_steps):
                 step_num = step + 1
-                
-                if is_warmup:
-                    print(f"{step_type} Step {step_num}/{self.warmup_steps}", end=" ")
-                else:
-                    collection_step = step_num - self.warmup_steps
-                    print(f"{step_type} Step {collection_step}/{self.collection_steps}", end=" ")
+                print(f"Warmup Step {step_num}/{self.warmup_steps}", end=" ")
                 
                 # Capture image
                 image = self._capture_image()
                 
-                # Get robot state
+                # Get robot state (no commands sent during data collection)
                 robot_state = self._get_robot_state()
+
+                # Print robot state for every step
+                if robot_state is not None:
+                    joint_angles = robot_state['joint_angles']
+                    ee_pos = robot_state['ee_position']
+                    ee_quat = robot_state['ee_quaternion']
+                    se3_transform = robot_state['T']
+                    print(f"- Joint Angles: [{joint_angles[0]:.3f}, {joint_angles[1]:.3f}, {joint_angles[2]:.3f}, {joint_angles[3]:.3f}, {joint_angles[4]:.3f}, {joint_angles[5]:.3f}]")
+                    print(f"  EE Position: [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]")
+                    print(f"  EE Quaternion: [{ee_quat[0]:.3f}, {ee_quat[1]:.3f}, {ee_quat[2]:.3f}, {ee_quat[3]:.3f}]")
+                    
                 
-                if is_warmup:
-                    # During warmup, collect data but don't save
-                    print(f"- Data collected (warmup, not saved)")
-                else:
-                    # During collection, save data
-                    collection_step = step - self.warmup_steps
-                    
-                    # Save image
-                    image_saved = self._save_image(collection_step, image)
-                    
-                    # Store robot data
-                    data_stored = self._store_robot_data(robot_state)
-                    
-                    if image_saved and data_stored:
-                        successful_steps += 1
-                        print(f"- Image and data saved successfully")
-                    elif image_saved:
-                        print(f"- Image saved, data storage failed")
-                    elif data_stored:
-                        print(f"- Data stored, image save failed")
-                    else:
-                        print(f"- Failed to save image and data")
+                print(f"- Data collected (warmup, not saved)")
                 
                 # Wait before next step
                 time.sleep(self.step_delay)
+            
+            print(f"\nWarmup completed! Starting collection phase...")
+            print("=== COLLECTION PHASE ===")
+            print("Camera streaming window will open. Use it to preview and capture images.")
+            print("Press 'c' in the streaming window to capture current frame.")
+            print("Press 'q' in the streaming window when you're done collecting data.\n")
+            
+            # Collection phase - use streaming window for interactive data collection
+            if self.camera_available:
+                self._show_streaming_window()
+                successful_steps = len(self.images_data)
+            else:
+                print("Camera not available. Cannot proceed with collection phase.")
+                return 0
                 
         except KeyboardInterrupt:
             print(f"\nData collection interrupted by user.")
         
         print(f"\nData collection completed!")
         print(f"Warmup steps completed: {self.warmup_steps}")
-        print(f"Successfully collected {successful_steps}/{self.collection_steps} steps")
+        print(f"Successfully collected {successful_steps} images and poses")
         
         # Save all robot data as numpy arrays in a single pkl file
         if successful_steps > 0:
@@ -398,8 +611,15 @@ def main():
     print("Z1 Robot Arm Free Drive Data Collection")
     print("=" * 50)
     
+    # Create timestamped output directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"free_drive_data_{timestamp}"
+    
+    # Camera resolution options: "VGA" (640x480), "HD" (1280x720), "FHD" (1920x1080)
+    resolution = "FHD"  # Change this to "VGA", "HD", or "FHD" as needed
+    
     # Create data collector
-    collector = FreeDriveDataCollector()
+    collector = FreeDriveDataCollector(output_dir=output_dir, resolution=resolution)
     
     try:
         # Enable free drive mode
@@ -417,9 +637,7 @@ def main():
         
         print(f"\nData collection summary:")
         print(f"- Warmup steps completed: {collector.warmup_steps}")
-        print(f"- Collection steps attempted: {collector.collection_steps}")
         print(f"- Successful collection steps: {successful_steps}")
-        print(f"- Success rate: {successful_steps/collector.collection_steps*100:.1f}%")
         print(f"- Output directory: {collector.output_dir}")
         if successful_steps > 0:
             print(f"- Images saved: {collector.output_dir}/images/")

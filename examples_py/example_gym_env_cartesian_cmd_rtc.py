@@ -167,12 +167,16 @@ def main():
         # Get current end-effector position and orientation from observation
         original_position = obs[12:15].copy()  # Store original position
         current_orientation = obs[15:19]  # Current end-effector orientation (quaternion)
-        target_gripper = 0  # -1 open, 1 close
+        target_gripper = 0 
         
         print(f"Original EE position: {original_position}")
         print(f"Current EE orientation: {current_orientation}")
         print()
         
+        # dscho debug to specify the position and orientation
+        original_position = np.array([0.41145274, -0.00121779, 0.40713578])
+        current_orientation = np.array([0.9998209, -0.0011671, -0.01868073, -0.00280654])
+
         # Define square vertices in YZ plane (0.1m x 0.1m square)
         square_size = 0.1  # 0.1m
         square_vertices = [
@@ -282,8 +286,16 @@ def main():
                 current_orient = obs[15:19] if 'obs' in locals() else current_orientation
                 action = np.concatenate([current_pos, current_orient, [target_gripper]])
             
+            # Print gripper command
+            gripper_cmd = action[7] if len(action) > 7 else 0.0
+            print(f"Step {step}: Gripper Command = {gripper_cmd:.3f} ({'Open' if gripper_cmd > 0 else 'Close' if gripper_cmd < 0 else 'Neutral'})")
+            
             # Execute step with the action
             obs, reward, done, info = env.step(action)
+            
+            # Print gripper state
+            gripper_state = obs[19] if len(obs) > 19 else 0.0
+            print(f"Step {step}: Gripper State = {gripper_state:.3f} ({'Open' if gripper_state > 0 else 'Close' if gripper_state < 0 else 'Neutral'})")
             
             # Collect errors for average calculation
             position_errors.append(info['position_error'])

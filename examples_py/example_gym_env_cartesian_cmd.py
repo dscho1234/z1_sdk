@@ -125,7 +125,7 @@ def main():
             time.sleep(inference_time)
             
             # Send command with inference time
-            obs, reward, done, info = env.step(action, inference_time)
+            obs, reward, done, info = env.step(action)
 
 
             # NOTE: if you want to do something while running the robot (but, you have to modify env.step ftn inside)
