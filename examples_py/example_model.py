@@ -12,8 +12,14 @@ q_FORWARD = np.array([0, 1.5, -1, 0.54, 0, 0])
 q_near_forward = np.array([0, 1.49, -1, 0.57, 0, 0])
 # 1. FK
 T_forward = armModel.forwardKinematics(q_FORWARD, 6)
+
+# dscho NOTE: debug
+q_current = np.array([0,  np.pi/2,  np.pi/2, np.pi/2, 0, 0])
+T_forward = np.eye(4)
+T_forward[:3, 3] = np.array([0.2, 0, 0.3])
+
 # 2. IK, q_result doesn't need to be near qPast
-hasIK, q_forward = armModel.inverseKinematics(T_forward, np.zeros(6), True)
+hasIK, q_forward = armModel.inverseKinematics(T_forward, q_current, True)
 if hasIK:
     print("The joint angles corresponding to position FORWRAD:")
     print(q_forward)
