@@ -2,8 +2,23 @@
 
 # Setup
 
-```bash
+## Option 1: Install as Python Package (Recommended)
 
+```bash
+# Install the package in development mode
+cd ~/Workspace/z1_sdk
+pip install -e .
+
+# Build the C++ extension (if needed)
+python setup.py build_ext
+
+# Verify installation
+python -c "import unitree_arm_sdk; print('Package installed successfully!')"
+```
+
+## Option 2: Manual Setup
+
+```bash
 cd ~/Workspace/z1_contoller
 mkdir -p build && cd build
 cmake ..
@@ -21,6 +36,7 @@ ls ../lib/unitree_arm_interface*.so
 export PYTHONPATH=$PYTHONPATH:$(realpath ../lib)
 or 
 cp ../lib/unitree_arm_interface*.so ../examples_py/
+```
 
 
 ```

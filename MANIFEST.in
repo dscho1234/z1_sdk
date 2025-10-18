@@ -1,0 +1,38 @@
+# Include license and readme files
+include LICENSE
+include README.md
+include CMakeLists.txt
+
+# Include C++ source files and headers
+recursive-include include *.h *.hh *.hpp *.cpp *.c
+
+# Include Python interface source
+include examples_py/arm_python_interface.cpp
+include examples_py/unitree_arm_interface.pyi
+
+# Include compiled libraries
+include lib/*.so
+include lib/*.dll
+include lib/*.pyd
+
+# Include Python modules and examples
+recursive-include envs *.py
+recursive-include examples_py *.py
+
+# Include utility scripts
+include *.py
+
+# Exclude build artifacts and cache
+global-exclude __pycache__
+global-exclude *.py[co]
+global-exclude build
+global-exclude *.egg-info
+global-exclude .git*
+global-exclude .DS_Store
+global-exclude *.swp
+global-exclude *.swo
+global-exclude *~
+
+# Exclude data directories (optional - remove if you want to include them)
+prune free_drive_data*
+prune build

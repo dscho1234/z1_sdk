@@ -1,0 +1,117 @@
+[build-system]
+requires = [
+    "setuptools>=45",
+    "wheel",
+    "cmake>=3.12",
+    "pybind11>=2.6.0",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unitree-z1-sdk"
+version = "1.0.0"
+description = "Unitree Z1 Robot Arm SDK for Python"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Unitree", email = "support@unitree.com"},
+]
+maintainers = [
+    {name = "Unitree", email = "support@unitree.com"},
+]
+keywords = ["robotics", "robot-arm", "unitree", "z1", "sdk", "control", "kinematics"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.19.0",
+    "gym>=0.21.0",
+    "opencv-python>=4.5.0",
+    "matplotlib>=3.3.0",
+    "scipy>=1.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "black>=21.0",
+    "flake8>=3.8",
+    "mypy>=0.800",
+    "cmake>=3.12",
+    "pybind11>=2.6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/unitreerobotics/z1_sdk"
+Repository = "https://github.com/unitreerobotics/z1_sdk"
+Documentation = "https://github.com/unitreerobotics/z1_sdk#readme"
+"Bug Tracker" = "https://github.com/unitreerobotics/z1_sdk/issues"
+
+[tool.setuptools]
+packages = ["unitree_arm_sdk", "envs"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"*" = ["*.so", "*.pyd", "*.dll"]
+"unitree_arm_sdk" = ["*.h", "*.hh"]
+
+[tool.black]
+line-length = 88
+target-version = ['py38', 'py39', 'py310', 'py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = [
+    "unitree_arm_interface.*",
+    "cv2.*",
+    "gym.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
