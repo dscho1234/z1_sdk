@@ -101,7 +101,7 @@ def generate_square_sequence(base_position, base_orientation, base_gripper, squa
         new_rot = start_rot * (start_rot.inv() * end_rot) ** t
         
         # Convert back to quaternion
-        new_orientation = new_rot.as_quat()
+        new_orientation = new_rot.as_quat().squeeze()
         
         # Gripper: alternate between open and close for each edge
         # Edge 0: open (1), Edge 1: close (-1), Edge 2: open (1), Edge 3: close (-1)
