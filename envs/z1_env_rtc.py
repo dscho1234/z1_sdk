@@ -52,15 +52,24 @@ class Z1BaseEnv(gym.Env):
         self.action_space = None
         self.observation_space = None
         
-    def reset(self) -> np.ndarray:
+    def reset(self, joint_angle: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Reset the environment to initial state.
+        
+        Args:
+            joint_angle: Optional joint angles to move to. If None, uses default reset behavior.
+                        Should be a 6-element array for 6-DOF arm.
         
         Returns:
             Initial observation
         """
         if self.is_initialized:
-            self.arm.backToStart()
+            if joint_angle is not None:
+                # Move to specified joint angles
+                print(f"Moving to specified joint angles: {joint_angle}")
+                self._move_to_joint_angles(joint_angle)
+            else:
+                self.arm.backToStart()
         else: # if not self.is_initialized:
             print("Initializing arm interface...")
             # Start the control loop first
@@ -74,8 +83,10 @@ class Z1BaseEnv(gym.Env):
             print("Skipping backToStart() to avoid potential hanging...")
             print("Using current robot position as starting point...")
             
-            
-            
+            # If joint_angle is specified during initialization, move to it
+            if joint_angle is not None:
+                print(f"Moving to specified joint angles during initialization: {joint_angle}")
+                self._move_to_joint_angles(joint_angle)
             
             self.is_initialized = True
         
@@ -108,6 +119,67 @@ class Z1BaseEnv(gym.Env):
         if self.has_gripper:
             self.current_gripper_pos = self.arm.lowstate.getGripperQ()
             self.current_gripper_vel = self.arm.gripperQd
+    
+    def _move_to_joint_angles(self, target_joint_angles: np.ndarray):
+        """
+        Move the robot to specified joint angles using low-level commands.
+        
+        Args:
+            target_joint_angles: Target joint angles (6-element array)
+        """
+        if len(target_joint_angles) != 6:
+            raise ValueError(f"Expected 6 joint angles, got {len(target_joint_angles)}")
+        
+        print(f"Moving to joint angles: {target_joint_angles}")
+        
+        # Set low-level command mode
+        self.arm.setFsmLowcmd()
+        
+        # Get current position as starting point
+        lastPos = np.array(self.arm.lowstate.getQ())
+        targetPos = target_joint_angles
+        
+        # Duration for smooth movement (about 2 seconds at 500Hz)
+        duration = 1000
+        
+        # Smooth interpolation to target position
+        for i in range(duration):
+            # Interpolate position
+            self.arm.q = lastPos * (1 - i/duration) + targetPos * (i/duration)
+            
+            # Calculate velocity for smooth movement
+            self.arm.qd = (targetPos - lastPos) / (duration * self.arm._ctrlComp.dt)
+            
+            # Calculate torque using inverse dynamics
+            self.arm.tau = self.arm_model.inverseDynamics(
+                self.arm.q, self.arm.qd, np.zeros(6), np.zeros(6)
+            )
+            
+            # Set arm commands
+            self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
+            
+            # Set gripper command (keep current gripper position)
+            if self.has_gripper:
+                self.arm.setGripperCmd(self.arm.gripperQ, self.arm.gripperQd, self.arm.gripperTau)
+            
+            # Send commands
+            self.arm.sendRecv()
+            time.sleep(self.arm._ctrlComp.dt)
+        
+        print("Joint movement completed")
+        print("Target joint angles: ", target_joint_angles)
+        print("Current joint angles: ", np.array(self.arm.lowstate.getQ()))
+        
+
+        time.sleep(1.0)
+        
+        # Restart the sendRecv thread and switch back to proper FSM state
+        # This is crucial to prevent hanging after low-level commands
+        self.arm.loopOn()  # Restart sendRecvThread
+        
+        # Switch to JOINTCTRL state to allow normal operation
+        self.arm.setFsm(unitree_arm_interface.ArmFSMState.JOINTCTRL)
+        print("Switched back to JOINTCTRL state")
         
     
     def _get_observation(self) -> np.ndarray:
@@ -229,9 +301,15 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         
         self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
         
-    def reset(self) -> np.ndarray:
-        """Reset the environment and return initial observation."""
-        super().reset()
+    def reset(self, joint_angle: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Reset the environment and return initial observation.
+        
+        Args:
+            joint_angle: Optional joint angles to move to. If None, uses default reset behavior.
+                        Should be a 6-element array for 6-DOF arm.
+        """
+        super().reset(joint_angle)
         
         # Start cartesian control mode
         self.arm.startTrack(unitree_arm_interface.ArmFSMState.CARTESIAN)
@@ -378,6 +456,15 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         self.sequence_index = start_index
         self.sequence_step_count = 0
         print(f"RTC: Set new sequence with shape {sequence.shape}, starting from index {start_index}")
+    
+    def get_current_sequence(self) -> np.ndarray:
+        """
+        Get the current sequence.
+        
+        Returns:
+            sequence: Current sequence
+        """
+        return self.current_sequence.copy()
     
     def get_next_action_from_sequence(self) -> np.ndarray:
         """

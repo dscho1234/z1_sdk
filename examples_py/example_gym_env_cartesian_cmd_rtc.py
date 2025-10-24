@@ -143,7 +143,10 @@ def main():
     try:
         # Reset the environment
         print("Resetting environment...")
-        obs = env.reset()
+        # joint_angle = np.array([1.0, 1.5, -1.0, -0.54, 0.0, 0.0])
+        joint_angle = np.array([-0.8, 2.572, -1.533, -0.609, 1.493, 1.004])
+        # joint_angle = None
+        obs = env.reset(joint_angle)
         print(f"Initial observation shape: {obs.shape}")
         print(f"Initial joint positions: {obs[:6]}")
         print(f"Initial end-effector position: {obs[12:15]}")
