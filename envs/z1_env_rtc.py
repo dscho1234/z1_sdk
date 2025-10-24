@@ -171,7 +171,7 @@ class Z1BaseEnv(gym.Env):
         print("Current joint angles: ", np.array(self.arm.lowstate.getQ()))
         
 
-        time.sleep(1.0)
+        # time.sleep(1.0)
         
         # Restart the sendRecv thread and switch back to proper FSM state
         # This is crucial to prevent hanging after low-level commands
