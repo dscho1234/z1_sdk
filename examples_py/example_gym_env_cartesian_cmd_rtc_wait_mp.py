@@ -1,52 +1,99 @@
 #!/usr/bin/env python3
 """
 Example usage of the Z1 Gym environment with end-effector pose control using cartesian commands
-and non-blocking inference system.
+and non-blocking step execution.
 
 This example demonstrates how to use the EEPoseCtrlCartesianCmdWrapper with the new
-non-blocking inference system to control the Z1 robot arm's end-effector pose.
+wait argument to control the Z1 robot arm's end-effector pose using non-blocking step execution.
 """
 
 import sys
 import os
 import numpy as np
 import time
+import torch
+import torch.nn as nn
 from scipy.spatial.transform import Rotation as R
 
 # Add the envs directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "envs"))
-from envs.z1_env_rtc import EEPoseCtrlCartesianCmdWrapper
+from envs.z1_env_rtc_wait_mp import EEPoseCtrlCartesianCmdWrapper
 
 
-def create_inference_function(target_sequence, inference_time=0.15):
+class DummyMLP(nn.Module):
+    """Simple dummy MLP model for thread-torch compatibility testing."""
+    def __init__(self, input_dim=21, hidden_dim=64, output_dim=8):
+        super(DummyMLP, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+    
+    def forward(self, x):
+        return self.network(x)
+
+
+def inference_function(observation, square_vertices, orientation_vertices, total_steps, current_step, dummy_mlp, sequence_length=16, inference_time=0.15):
     """
-    Create an inference function that simulates neural network inference for RTC-style future sequences.
-    This function simply returns the pre-computed target sequence after simulating inference time.
+    Simulate inference function that takes observation and returns action sequence.
+    This uses the same square sequence generation as the original example.
     
     Args:
-        target_sequence: Pre-computed target pose sequence [sequence_length, 8]
-        inference_time: Time to simulate inference
+        observation: Current observation from the environment
+        square_vertices: List of square vertices defining the path
+        orientation_vertices: List of orientations for each vertex
+        total_steps: Total number of steps for the entire square path
+        current_step: Current step to start the sequence from
+        dummy_mlp: Dummy MLP model for thread-torch compatibility testing
+        sequence_length: Length of target pose sequence to generate
+        inference_time: Time to simulate inference (seconds)
+        
+    Returns:
+        action_sequence: Generated action sequence [sequence_length, 8]
     """
-    def inference_function():
-        # Simulate neural network inference that generates a future target pose sequence
-        # In real scenario, this would be your neural network model (e.g., diffusion/flow model)
-        
-        print(f"Starting RTC neural network inference (simulating {inference_time:.3f}s)...")
-        
-        # Simulate inference time - this is where your actual neural network would run
-        time.sleep(inference_time)
-        
-        # Return the pre-computed target sequence
-        print(f"RTC neural network inference completed: returning pre-computed sequence with shape {target_sequence.shape}")
-        return target_sequence
+    print(f"Starting inference with observation shape {observation.shape} (simulating {inference_time:.3f}s)...")
     
-    return inference_function
+    # Dummy MLP inference for thread-torch compatibility testing
+    with torch.no_grad():
+        # Convert observation to tensor and add batch dimension
+        obs_tensor = torch.FloatTensor(observation).unsqueeze(0)
+        dummy_output = dummy_mlp(obs_tensor)
+        print(f"Dummy MLP inference completed: device: {dummy_output.device}, input shape {obs_tensor.shape}, output shape {dummy_output.shape}")
+    
+    # Simulate inference time
+    time.sleep(inference_time)
+    
+    # Extract current position and orientation from observation
+    current_pos = observation[12:15]  # End-effector position
+    current_orient = observation[15:19]  # End-effector orientation (quaternion)
+    current_gripper = observation[19]  # Gripper position
+    
+    # Use the same square sequence generation as the original example
+    action_sequence = generate_action_sequence(
+        current_pos, current_orient, current_gripper, 
+        square_vertices, orientation_vertices, 
+        total_steps, current_step, sequence_length
+    )
+    
+    print(f"Inference completed: generated sequence with shape {action_sequence.shape}")
+    return action_sequence
 
 
-def generate_square_sequence(base_position, base_orientation, base_gripper, square_vertices, orientation_vertices, total_steps, current_step, sequence_length=10):
+def generate_action_sequence(base_position, base_orientation, base_gripper, square_vertices, orientation_vertices, total_steps, current_step, sequence_length=10):
     """
     Generate a target pose sequence that follows the square path.
-    The square path is divided into total_steps, and we return sequence_length steps starting from current_step.
+    This function generates the sequence directly without simulation of inference time.
     
     Args:
         base_position: Base position to use as starting point
@@ -116,15 +163,23 @@ def generate_square_sequence(base_position, base_orientation, base_gripper, squa
     return sequence
 
 
+
+
 def main():
     """Main example function."""
-    print("Z1 Gym Environment Example - RTC-style Future Sequence Handling")
+    print("Z1 Gym Environment Example - Non-blocking Step Execution")
     print("=" * 80)
+    
+    # Create dummy MLP model for thread-torch compatibility testing
+    # Note: observation shape is 21, so we need to match that
+    dummy_mlp = DummyMLP(input_dim=21, hidden_dim=4096, output_dim=8)
+    dummy_mlp.eval()  # Set to evaluation mode
+    print(f"Created dummy MLP model: {dummy_mlp}")
     
     # Create the environment with 5Hz control frequency
     control_frequency = 2 # 5
-    inference_time = 0.15  # Neural network inference time
     sequence_length = 16   # Length of future target pose sequences
+    step_interval = 1.0 / control_frequency  # Time between steps in seconds
     
     env = EEPoseCtrlCartesianCmdWrapper(
         has_gripper=True,
@@ -133,7 +188,8 @@ def main():
         orientation_tolerance=0.1,
         angular_vel=1.0,  # Angular velocity limit
         linear_vel=0.3,   # Linear velocity limit
-        sequence_length=sequence_length,  # Length of future sequences from inference
+        sequence_length=sequence_length,  # Length of future sequences
+        
     )
     
     print(f"Action space: {env.action_space}")
@@ -144,8 +200,8 @@ def main():
         # Reset the environment
         print("Resetting environment...")
         # joint_angle = np.array([1.0, 1.5, -1.0, -0.54, 0.0, 0.0])
-        joint_angle = np.array([-0.8, 2.572, -1.533, -0.609, 1.493, 1.004])
-        # joint_angle = None
+        # joint_angle = np.array([-0.8, 2.572, -1.533, -0.609, 1.493, 1.004])
+        joint_angle = None
         obs = env.reset(joint_angle)
         print(f"Initial observation shape: {obs.shape}")
         print(f"Initial joint positions: {obs[:6]}")
@@ -155,15 +211,15 @@ def main():
         print()
     
         
-        # Example: RTC-style future sequence handling with square movement
-        print("Example: RTC-style future sequence handling with square movement")
-        print("Using non_blocking_inference for future target pose sequences")
+        # Example: Non-blocking step execution with square movement
+        print("Example: Non-blocking step execution with square movement")
+        print("Using wait=False for non-blocking step execution")
         print("Gripper will alternate between open and close for each edge")
         print("Orientation will change roll: 0°, +90°, 0°, -90°, 0° for each edge")
         print(f"Control frequency: {control_frequency} Hz")
+        print(f"Step interval: {step_interval:.3f}s")
         print(f"Angular velocity limit: {env.angular_vel} rad/s")
         print(f"Linear velocity limit: {env.linear_vel} m/s")
-        print(f"Inference time: {inference_time}s")
         print(f"Sequence length: {sequence_length}")
         print()
         
@@ -209,111 +265,111 @@ def main():
 
         
         total_steps = 30
-
+        inference_time = 0.15  # Inference time in seconds
         
-        # Generate the first target sequence
-        target_sequence = generate_square_sequence(
-            original_position, current_orientation, target_gripper, square_vertices, orientation_vertices, total_steps, 0, sequence_length
-        )
-        print(f"Generated first target sequence with shape: {target_sequence.shape}")
+        print(f"Running non-blocking control with overlapped inference for {total_steps} steps")
+        print(f"Inference time: {inference_time}s")
+        print(f"Step interval: {step_interval:.3f}s")
+        print("Note: Get observation → Execute step immediately → Run inference while robot moves")
         print()
-        
-        
-        
-        print(f"Running RTC-style control for {total_steps} steps")
-        print(f"Each inference uses a pre-computed sequence of {sequence_length} future target poses")
-        print(f"Inference time: {inference_time}s (simulated neural network processing)")
-        print()
-        
-        # RTC-style execution: track inference delay and handle sequence switching
-        current_sequence = target_sequence
-        env.set_current_sequence(current_sequence, 0)
-        
-        # Track inference delay (steps passed during inference)
-        inference_start_step = 0
         
         # Track errors for average calculation
         position_errors = []
         orientation_errors = []
         
-        # Start first inference
-        inference_func = create_inference_function(target_sequence, inference_time)
-        env.non_blocking_inference(inference_func, inference_time)
-        inference_start_step = 0
+        # Sequence tracking variables
+        current_action_sequence = None
+        current_action_index = 0
+        latest_inference_result = None
         
+        # Generate initial action sequence from o_0 (before for loop)
+        print("Generating initial action sequence from o_0...")
+        current_action_sequence = inference_function(
+            obs, square_vertices, orientation_vertices, total_steps, 0, dummy_mlp, sequence_length, inference_time
+        ) # o_0 -> a_0, a_1, a_2, ...
+        current_action_index = 0
+        
+        # Main execution loop for all steps
         for step in range(total_steps):
-            # Check if inference is complete and get new sequence
-            if not (env.inference_process and env.inference_process.is_alive()):
-                # Inference completed, get new sequence
-                
-                new_sequence = env.action_queue.get_nowait()
-                inference_delay = step - inference_start_step
-                
-                print(f"RTC: Inference completed at step {step}, delay was {inference_delay} steps")
-                print(f"RTC: New sequence shape: {new_sequence.shape}")
-                
-                # RTC-style sequence switching: skip past poses
-                if inference_delay < len(new_sequence):
-                    start_index = inference_delay
-                    print(f"RTC: Starting from index {start_index} (skipped {inference_delay} past poses)")
-                else:
-                    start_index = len(new_sequence) - 1
-                    print(f"RTC: All poses are past, using last pose (index {start_index})")
-                
-                # Set new sequence with appropriate start index
-                env.set_current_sequence(new_sequence, start_index)
-                current_sequence = new_sequence
-                
-                # Immediately start new inference after getting the result
-                current_pos = obs[12:15] if 'obs' in locals() else original_position
-                current_orient = obs[15:19] if 'obs' in locals() else current_orientation
-                
-                # Generate new target sequence starting from current step
-                new_target_sequence = generate_square_sequence(
-                    current_pos, current_orient, target_gripper, square_vertices, orientation_vertices, total_steps, step, sequence_length
-                )
-                
-                # Start new inference immediately
-                inference_func = create_inference_function(new_target_sequence, inference_time)
-                env.non_blocking_inference(inference_func, inference_time)
-                inference_start_step = step
-                print(f"RTC: Started new inference immediately at step {step}")
-                
-            # Get next action from current sequence
-            action = env.get_next_action_from_sequence()
-            if action is None:
-                print("This line should not be reached, since it means we used all action chunks and still do not have a new sequence.")
-                print("RTC: No action available, maintaining current pose.")
-                # Maintain current pose if no sequence available
-                current_pos = obs[12:15] if 'obs' in locals() else original_position
-                current_orient = obs[15:19] if 'obs' in locals() else current_orientation
+            print(f"\nStep {step}: Processing")
+            print("-" * 40)
+            
+            # Select action for current step (use current sequence)
+            if current_action_sequence is not None and current_action_index < len(current_action_sequence):
+                # Use action from current sequence
+                action = current_action_sequence[current_action_index] # a_t
+                current_action_index += 1
+                print(f"Step {step}: Using action a_{step} from sequence (index {current_action_index-1})")
+            else:
+                # Fallback: maintain current pose
+                current_pos = obs[12:15]
+                current_orient = obs[15:19]
                 action = np.concatenate([current_pos, current_orient, [target_gripper]])
+                print(f"Step {step}: No action available, maintaining current pose")
             
             # Print gripper command
             gripper_cmd = action[7] if len(action) > 7 else 0.0
             print(f"Step {step}: Gripper Command = {gripper_cmd:.3f} ({'Open' if gripper_cmd > 0 else 'Close' if gripper_cmd < 0 else 'Neutral'})")
             
-            # Execute step with the action
-            obs, reward, done, info = env.step(action)
+            # Execute step with non-blocking execution
+            print(f"Step {step}: Executing action a_{step} with non-blocking...")
+            
+            start = time.time()
+            env.step(action, wait=False) # a_t
+            print(f"Step {step}: Started non-blocking execution in {time.time() - start:.6f}s")
+            
+            # Run inference in main process while robot is moving (step > 0 and not last step)
+            if step > 0 and step < total_steps - 1:  # Don't run inference for step 0 or last step
+                print(f"Step {step}: Running inference with o_{step} while robot moves...")
+                inference_start_time = time.time()
+                latest_inference_result = inference_function(
+                    obs, square_vertices, orientation_vertices, total_steps, step, dummy_mlp, sequence_length, inference_time
+                ) # o_t+1 -> a_t+1, a_t+2, a_t+3, ...
+                inference_time_actual = time.time() - inference_start_time
+                print(f"Step {step}: Inference completed in {inference_time_actual:.3f}s")
+                
+                # Update action sequence with latest inference result for next step
+                if latest_inference_result is not None:
+                    current_action_sequence = latest_inference_result
+                    current_action_index = 1  # Reset index for new sequence, NOTE: we assume that inference is completed before env.step is finished
+                    print(f"Step {step}: Updated action sequence for next steps")
+            
+            
+            print(f"Step {step}: Waiting for o_{step+1}...")
+            start = time.time()
+            while not env.is_step_complete():
+                time.sleep(0.001)  # Small sleep to avoid busy waiting
+            print(f"Step {step}: Waited for {time.time() - start:.6f}s for o_{step+1}")
+
+            # Get the result from background execution
+            start = time.time()
+            result = env.get_step_result()
+            if result:
+                obs, reward, done, info = result # o_t+1, r_t, etc
+                print(f"Step {step}: Received o_{step+1}, time taken: {time.time() - start:.6f}s")
+            else:
+                print(f"Step {step}: Warning - No result from background step")
+                # Use previous observation if no result
+                pass
             
             # Print gripper state
             gripper_state = obs[19] if len(obs) > 19 else 0.0
-            print(f"Step {step}: Gripper State = {gripper_state:.3f} ({'Open' if gripper_state > 0 else 'Close' if gripper_state < 0 else 'Neutral'})")
+            print(f"Step {step}: Gripper State = {gripper_state:.3f}")
             
             # Collect errors for average calculation
             position_errors.append(info['position_error'])
             orientation_errors.append(info['orientation_error'])
             
-            
-            
             if done:
                 print(f"Episode finished at step {step}!")
                 break
         
+        
+        
         # Print final status
         final_pos = obs[12:15]
         final_error = info['position_error']
-        print(f"\nRTC-style square movement completed!")
+        print(f"\nNon-blocking square movement completed!")
         print(f"Final position: [{final_pos[0]:.3f}, {final_pos[1]:.3f}, {final_pos[2]:.3f}]")
         print(f"Final position error: {final_error:.4f}")
         print(f"Final FSM state: {info['fsm_state']}")
@@ -333,7 +389,7 @@ def main():
             print(f"  Total steps executed: {len(position_errors)}")
         
         print()
-        print("\nRTC-style square movement with proper sequence handling completed successfully!")
+        print("\nNon-blocking square movement with sequence handling completed successfully!")
         
     except KeyboardInterrupt:
         print("\nInterrupted by user")

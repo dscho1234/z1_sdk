@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Example usage of the Z1 Gym environment with end-effector pose control using cartesian commands
-and non-blocking step execution.
+and multiprocess step execution.
 
-This example demonstrates how to use the EEPoseCtrlCartesianCmdWrapper with the new
-wait argument to control the Z1 robot arm's end-effector pose using non-blocking step execution.
+This example demonstrates how to use the EEPoseCtrlCartesianCmdWrapper with multiprocess
+execution to control the Z1 robot arm's end-effector pose using non-blocking step execution.
 """
 
 import sys
@@ -14,10 +14,166 @@ import time
 import torch
 import torch.nn as nn
 from scipy.spatial.transform import Rotation as R
+import multiprocessing
+import cloudpickle
+import pickle
 
 # Add the envs directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "envs"))
-from envs.z1_env_rtc_wait_R import EEPoseCtrlCartesianCmdWrapper
+from envs.z1_env_rtc import EEPoseCtrlCartesianCmdWrapper
+
+
+class CloudpickleWrapper(object):
+    def __init__(self, var):
+        """
+        Uses cloudpickle to serialize contents (otherwise multiprocessing tries to use pickle)
+
+        :param var: (Any) the variable you wish to wrap for pickling with cloudpickle
+        """
+        self.var = var
+
+    def __getstate__(self):
+        return cloudpickle.dumps(self.var)
+
+    def __setstate__(self, obs):
+        self.var = pickle.loads(obs)
+
+
+def make_env(control_frequency=2, sequence_length=16, position_tolerance=0.01, 
+             orientation_tolerance=0.1, angular_vel=1.0, linear_vel=0.3, has_gripper=True):
+    """
+    Utility function for multiprocessed env.
+
+    :param control_frequency: (int) control frequency in Hz
+    :param sequence_length: (int) length of future target pose sequences
+    :param position_tolerance: (float) position tolerance
+    :param orientation_tolerance: (float) orientation tolerance
+    :param angular_vel: (float) angular velocity limit
+    :param linear_vel: (float) linear velocity limit
+    :param has_gripper: (bool) whether to include gripper
+    """
+    def _init():
+        env = EEPoseCtrlCartesianCmdWrapper(
+            has_gripper=has_gripper,
+            control_frequency=control_frequency,
+            position_tolerance=position_tolerance,
+            orientation_tolerance=orientation_tolerance,
+            angular_vel=angular_vel,
+            linear_vel=linear_vel,
+            sequence_length=sequence_length,
+        )
+        return env
+    
+    return _init
+
+
+def _worker(remote, parent_remote, env_fn_wrapper):
+    parent_remote.close()
+    env = env_fn_wrapper.var()
+    while True:
+        try:
+            cmd, data = remote.recv()
+            if cmd == 'step':
+                observation, reward, done, info = env.step(data)
+                remote.send((observation, reward, done, info))
+            elif cmd == 'reset':
+                observation = env.reset(data)
+                remote.send(observation)
+            elif cmd == 'close':
+                remote.close()
+                break
+            # elif cmd == 'get_spaces':
+            #     remote.send((env.observation_space, env.action_space))
+            # elif cmd == '_get_current_ee_pose':
+            #     remote.send(env._get_current_ee_pose())
+            elif cmd == 'env_method':
+                method = getattr(env, data[0])
+                remote.send(method(*data[1], **data[2]))
+            elif cmd == 'get_attr':
+                remote.send(getattr(env, data))
+            elif cmd == 'set_attr':
+                remote.send(setattr(env, data[0], data[1]))
+            else:
+                raise NotImplementedError
+        except EOFError:
+            break
+
+
+class PipeEnv:
+    """
+    Single environment wrapper using multiprocessing pipe for communication.
+    """
+    
+    def __init__(self, env_fn, start_method=None):
+        self.waiting = False
+        self.closed = False
+        
+        if start_method is None:
+            # Fork is not a thread safe method (see issue #217)
+            # but is more user friendly (does not require to wrap the code in
+            # a `if __name__ == "__main__":`)
+            forkserver_available = 'forkserver' in multiprocessing.get_all_start_methods()
+            start_method = 'forkserver' if forkserver_available else 'spawn'
+        ctx = multiprocessing.get_context(start_method)
+
+        self.remote, self.work_remote = ctx.Pipe(duplex=True)
+        args = (self.work_remote, self.remote, CloudpickleWrapper(env_fn))
+        # daemon=True: if the main process crashes, we should not cause things to hang
+        self.process = ctx.Process(target=_worker, args=args, daemon=True)
+        self.process.start()
+        self.work_remote.close()
+
+        # self.remote.send(('get_spaces', None))
+        # self.observation_space, self.action_space = self.remote.recv()
+
+    def step_async(self, action):
+        self.remote.send(('step', action))
+        self.waiting = True
+
+    def step_wait(self):
+        result = self.remote.recv()
+        self.waiting = False
+        observation, reward, done, info = result
+        return observation, reward, done, info
+
+    def step(self, action):
+        """
+        Step the environment with the given action (non-blocking)
+        This starts the step in background and returns immediately.
+        Use step_wait() to get the results.
+
+        :param action: ([int] or [float]) the action
+        :return: None (use step_wait() to get results)
+        """
+        self.step_async(action)
+
+    def reset(self, joint_angle=None):
+        self.remote.send(('reset', joint_angle))
+        return self.remote.recv()
+
+    def close(self):
+        if self.closed:
+            return
+        if self.waiting:
+            self.remote.recv()
+        self.remote.send(('close', None))
+        self.process.join()
+        self.closed = True
+
+    def env_method(self, method_name, *method_args, **method_kwargs):
+        """Call instance methods of environment."""
+        self.remote.send(('env_method', (method_name, method_args, method_kwargs)))
+        return self.remote.recv()
+
+    def get_attr(self, attr_name):
+        """Return attribute from environment."""
+        self.remote.send(('get_attr', attr_name))
+        return self.remote.recv()
+
+    def set_attr(self, attr_name, value):
+        """Set attribute inside environment."""
+        self.remote.send(('set_attr', (attr_name, value)))
+        return self.remote.recv()
 
 
 class DummyMLP(nn.Module):
@@ -44,7 +200,7 @@ class DummyMLP(nn.Module):
         return self.network(x)
 
 
-def inference_function(observation, square_vertices, orientation_vertices, total_steps, current_step, dummy_mlp, sequence_length=16, inference_time=0.15, env=None):
+def inference_function(observation, square_vertices, orientation_vertices, total_steps, current_step, dummy_mlp, sequence_length=16, inference_time=0.15):
     """
     Simulate inference function that takes observation and returns action sequence.
     This uses the same square sequence generation as the original example.
@@ -71,16 +227,12 @@ def inference_function(observation, square_vertices, orientation_vertices, total
         dummy_output = dummy_mlp(obs_tensor)
         print(f"Dummy MLP inference completed: device: {dummy_output.device}, input shape {obs_tensor.shape}, output shape {dummy_output.shape}")
     
-    start = time.time()
-    env._get_current_ee_pose()
-    print(f"In inference function, get_current_ee_pose time: {time.time() - start:.6f}s")
-
     # Simulate inference time
     time.sleep(inference_time)
     
     # Extract current position and orientation from observation
     current_pos = observation[12:15]  # End-effector position
-    current_orient = observation[15:19]  # End-effector orientation (quaternion in [x,y,z,w] format)
+    current_orient = observation[15:19]  # End-effector orientation (quaternion)
     current_gripper = observation[19]  # Gripper position
     
     # Use the same square sequence generation as the original example
@@ -144,7 +296,6 @@ def generate_action_sequence(base_position, base_orientation, base_gripper, squa
         end_orientation = orientation_vertices[edge_index + 1]
         
         # Use SLERP (Spherical Linear Interpolation) for proper quaternion interpolation
-        # start_orientation and end_orientation are in [x,y,z,w] format
         start_rot = R.from_quat(start_orientation)
         end_rot = R.from_quat(end_orientation)
         
@@ -152,7 +303,7 @@ def generate_action_sequence(base_position, base_orientation, base_gripper, squa
         # This uses scipy's built-in SLERP functionality
         new_rot = start_rot * (start_rot.inv() * end_rot) ** t
         
-        # Convert back to quaternion (returns [x,y,z,w] format)
+        # Convert back to quaternion
         new_orientation = new_rot.as_quat().squeeze()
         
         # Gripper: alternate between open and close for each edge
@@ -162,18 +313,15 @@ def generate_action_sequence(base_position, base_orientation, base_gripper, squa
         else:
             new_gripper = -1.0  # Close
         
-        # Combine into action: [x, y, z, qx, qy, qz, qw, gripper]
-        # new_orientation is in [x,y,z,w] format, which matches the expected action format
+        # Combine into action
         sequence[i] = np.concatenate([target_position, new_orientation, [new_gripper]])
     
     return sequence
 
 
-
-
 def main():
     """Main example function."""
-    print("Z1 Gym Environment Example - Non-blocking Step Execution")
+    print("Z1 Gym Environment Example - Multiprocess Step Execution")
     print("=" * 80)
     
     # Create dummy MLP model for thread-torch compatibility testing
@@ -185,65 +333,65 @@ def main():
     # Create the environment with 5Hz control frequency
     control_frequency = 2 # 5
     sequence_length = 16   # Length of future target pose sequences
-    step_interval = 1.0 / control_frequency  # Time between steps in seconds
     
-    env = EEPoseCtrlCartesianCmdWrapper(
-        has_gripper=True,
-        control_frequency=control_frequency,  # 5Hz control frequency
+    # Create environment function
+    env_fn = make_env(
+        control_frequency=control_frequency,
+        sequence_length=sequence_length,
         position_tolerance=0.01,
         orientation_tolerance=0.1,
-        angular_vel=1.0,  # Angular velocity limit
-        linear_vel=0.3,   # Linear velocity limit
-        sequence_length=sequence_length,  # Length of future sequences
-        
+        angular_vel=1.0,
+        linear_vel=0.3,
+        has_gripper=True
     )
     
-    print(f"Action space: {env.action_space}")
-    print(f"Observation space: {env.observation_space}")
+    # Create multiprocess environment
+    env = PipeEnv(env_fn)
+    
+    # print(f"Action space: {env.action_space}")
+    # print(f"Observation space: {env.observation_space}")
     print()
     
     try:
         # Reset the environment
         print("Resetting environment...")
         # joint_angle = np.array([1.0, 1.5, -1.0, -0.54, 0.0, 0.0])
-        joint_angle = np.array([-0.8, 2.572, -1.533, -0.609, 1.493, 1.004])
-        # joint_angle = None
-        obs = env.reset(joint_angle) # , option="lowcmd"
+        # joint_angle = np.array([-0.8, 2.572, -1.533, -0.609, 1.493, 1.004])
+        joint_angle = None
+        obs = env.reset(joint_angle)
         print(f"Initial observation shape: {obs.shape}")
         print(f"Initial joint positions: {obs[:6]}")
         print(f"Initial end-effector position: {obs[12:15]}")
-        print(f"Initial end-effector orientation (quaternion [x,y,z,w]): {obs[15:19]}")
+        print(f"Initial end-effector orientation: {obs[15:19]}")
         print(f"Initial gripper position: {obs[19]}")
         print()
     
-        
+        current_ee_pose = env.env_method('_get_current_ee_pose')
+        print(f"Current end-effector pose: {current_ee_pose} type : {type(current_ee_pose)}")
+        print()
+        temp = current_ee_pose.copy()
+
         # Example: Non-blocking step execution with square movement
-        print("Example: Non-blocking step execution with square movement")
-        print("Using wait=False for non-blocking step execution")
+        print("Example: Multiprocess step execution with square movement")
+        print("Using multiprocess environment for step execution")
         print("Gripper will alternate between open and close for each edge")
         print("Orientation will change roll: 0°, +90°, 0°, -90°, 0° for each edge")
         print(f"Control frequency: {control_frequency} Hz")
-        print(f"Step interval: {step_interval:.3f}s")
-        print(f"Angular velocity limit: {env.angular_vel} rad/s")
-        print(f"Linear velocity limit: {env.linear_vel} m/s")
         print(f"Sequence length: {sequence_length}")
         print()
         
         # Get current end-effector position and orientation from observation
         original_position = obs[12:15].copy()  # Store original position
-        current_orientation = obs[15:19]  # Current end-effector orientation (quaternion in [x,y,z,w] format)
+        current_orientation = obs[15:19]  # Current end-effector orientation (quaternion)
         target_gripper = 0 
         
         print(f"Original EE position: {original_position}")
-        print(f"Current EE orientation (quaternion [x,y,z,w]): {current_orientation}")
+        print(f"Current EE orientation: {current_orientation}")
         print()
         
         # dscho debug to specify the position and orientation
         original_position = np.array([0.41145274, -0.00121779, 0.40713578])
-        # Convert from [w,x,y,z] to [x,y,z,w] format for scipy compatibility
-        current_orientation_wxyz = np.array([0.9998209, -0.0011671, -0.01868073, -0.00280654])  # [w,x,y,z]
-        current_orientation = np.array([current_orientation_wxyz[1], current_orientation_wxyz[2], 
-                                       current_orientation_wxyz[3], current_orientation_wxyz[0]])  # [x,y,z,w]
+        current_orientation = np.array([0.9998209, -0.0011671, -0.01868073, -0.00280654])
 
         # Define square vertices in YZ plane (0.1m x 0.1m square)
         square_size = 0.1  # 0.1m
@@ -260,11 +408,11 @@ def main():
         orientation_vertices = []
         
         for roll_angle in roll_angles:
-            # Convert base orientation (quaternion in [x,y,z,w] format) to rotation matrix, apply roll, convert back
-            base_rot = R.from_quat(current_orientation)  # current_orientation is in [x,y,z,w] format
+            # Convert base orientation (quaternion) to rotation matrix, apply roll, convert back
+            base_rot = R.from_quat(current_orientation)
             roll_rot = R.from_euler('x', roll_angle)
             new_rot = base_rot * roll_rot
-            orientation_vertices.append(new_rot.as_quat())  # Returns [x,y,z,w] format
+            orientation_vertices.append(new_rot.as_quat())
         
         print("Square movement plan:")
         for i, vertex in enumerate(square_vertices):
@@ -276,10 +424,9 @@ def main():
         total_steps = 30
         inference_time = 0.15  # Inference time in seconds
         
-        print(f"Running non-blocking control with overlapped inference for {total_steps} steps")
+        print(f"Running multiprocess control with overlapped inference for {total_steps} steps")
         print(f"Inference time: {inference_time}s")
-        print(f"Step interval: {step_interval:.3f}s")
-        print("Note: Get observation → Execute step immediately → Run inference while robot moves")
+        print("Note: Get observation → Execute step in subprocess → Run inference while robot moves")
         print()
         
         # Track errors for average calculation
@@ -294,7 +441,7 @@ def main():
         # Generate initial action sequence from o_0 (before for loop)
         print("Generating initial action sequence from o_0...")
         current_action_sequence = inference_function(
-            obs, square_vertices, orientation_vertices, total_steps, 0, dummy_mlp, sequence_length, inference_time, env
+            obs, square_vertices, orientation_vertices, total_steps, 0, dummy_mlp, sequence_length, inference_time
         ) # o_0 -> a_0, a_1, a_2, ...
         current_action_index = 0
         
@@ -320,11 +467,11 @@ def main():
             gripper_cmd = action[7] if len(action) > 7 else 0.0
             print(f"Step {step}: Gripper Command = {gripper_cmd:.3f} ({'Open' if gripper_cmd > 0 else 'Close' if gripper_cmd < 0 else 'Neutral'})")
             
-            # Execute step with non-blocking execution
-            print(f"Step {step}: Executing action a_{step} with non-blocking...")
+            # Execute step with non-blocking multiprocess execution
+            print(f"Step {step}: Executing action a_{step} with non-blocking multiprocess...")
             
             start = time.time()
-            env.step(action, wait=False) # a_t
+            env.step(action) # a_t - starts in background, returns immediately
             print(f"Step {step}: Started non-blocking execution in {time.time() - start:.6f}s")
             
             # Run inference in main process while robot is moving (step > 0 and not last step)
@@ -332,7 +479,7 @@ def main():
                 print(f"Step {step}: Running inference with o_{step} while robot moves...")
                 inference_start_time = time.time()
                 latest_inference_result = inference_function(
-                    obs, square_vertices, orientation_vertices, total_steps, step, dummy_mlp, sequence_length, inference_time, env
+                    obs, square_vertices, orientation_vertices, total_steps, step, dummy_mlp, sequence_length, inference_time
                 ) # o_t+1 -> a_t+1, a_t+2, a_t+3, ...
                 inference_time_actual = time.time() - inference_start_time
                 print(f"Step {step}: Inference completed in {inference_time_actual:.3f}s")
@@ -343,23 +490,11 @@ def main():
                     current_action_index = 1  # Reset index for new sequence, NOTE: we assume that inference is completed before env.step is finished
                     print(f"Step {step}: Updated action sequence for next steps")
             
-            
+            # Wait for step completion and get results
             print(f"Step {step}: Waiting for o_{step+1}...")
             start = time.time()
-            while not env.is_step_complete():
-                time.sleep(0.001)  # Small sleep to avoid busy waiting
+            obs, reward, done, info = env.step_wait()
             print(f"Step {step}: Waited for {time.time() - start:.6f}s for o_{step+1}")
-
-            # Get the result from background execution
-            start = time.time()
-            result = env.get_step_result()
-            if result:
-                obs, reward, done, info = result # o_t+1, r_t, etc
-                print(f"Step {step}: Received o_{step+1}, time taken: {time.time() - start:.6f}s")
-            else:
-                print(f"Step {step}: Warning - No result from background step")
-                # Use previous observation if no result
-                pass
             
             # Print gripper state
             gripper_state = obs[19] if len(obs) > 19 else 0.0
@@ -374,19 +509,16 @@ def main():
                 break
         
         
-        
         # Print final status
         final_pos = obs[12:15]
         final_error = info['position_error']
-        print(f"\nNon-blocking square movement completed!")
+        print(f"\nMultiprocess square movement completed!")
         print(f"Final position: [{final_pos[0]:.3f}, {final_pos[1]:.3f}, {final_pos[2]:.3f}]")
         print(f"Final position error: {final_error:.4f}")
         print(f"Final FSM state: {info['fsm_state']}")
         print(f"Final cartesian directions: {info['cartesian_directions']}")
         print(f"Final speeds - Linear: {info['actual_linear_speed']:.3f}, Angular: {info['actual_angular_speed']:.3f}, Gripper: {info['gripper_speed']:.3f}")
         print(f"DT ratio (actual_control_time/arm_dt): {info['dt_ratio']}")
-        print(f"Final sequence index: {env.sequence_index}")
-        print(f"Final sequence length: {len(env.current_sequence) if env.current_sequence is not None else 0}")
         
         # Calculate and print average errors
         if position_errors:
@@ -398,7 +530,7 @@ def main():
             print(f"  Total steps executed: {len(position_errors)}")
         
         print()
-        print("\nNon-blocking square movement with sequence handling completed successfully!")
+        print("\nMultiprocess square movement with sequence handling completed successfully!")
         
     except KeyboardInterrupt:
         print("\nInterrupted by user")

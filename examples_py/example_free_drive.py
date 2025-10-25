@@ -24,7 +24,7 @@ import pickle
 import numpy as np
 import cv2
 from datetime import datetime
-
+from scipy.spatial.transform import Rotation as R
 # Add the lib directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "lib"))
 import unitree_arm_interface
@@ -360,7 +360,7 @@ class FreeDriveDataCollector:
             ee_rotation_matrix = T[:3, :3]
             
             # Convert rotation matrix to quaternion
-            ee_quaternion = self._rotation_matrix_to_quaternion(ee_rotation_matrix)
+            ee_quaternion = R.from_matrix(ee_rotation_matrix).as_quat()
             
             return {
                 'joint_angles': joint_angles,
@@ -377,36 +377,7 @@ class FreeDriveDataCollector:
             print(f"Error getting robot state: {e}")
             return None
     
-    def _rotation_matrix_to_quaternion(self, R):
-        """Convert rotation matrix to quaternion (w, x, y, z)."""
-        trace = np.trace(R)
-        
-        if trace > 0:
-            s = np.sqrt(trace + 1.0) * 2  # s = 4 * qw
-            qw = 0.25 * s
-            qx = (R[2, 1] - R[1, 2]) / s
-            qy = (R[0, 2] - R[2, 0]) / s
-            qz = (R[1, 0] - R[0, 1]) / s
-        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-            s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2  # s = 4 * qx
-            qw = (R[2, 1] - R[1, 2]) / s
-            qx = 0.25 * s
-            qy = (R[0, 1] + R[1, 0]) / s
-            qz = (R[0, 2] + R[2, 0]) / s
-        elif R[1, 1] > R[2, 2]:
-            s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2  # s = 4 * qy
-            qw = (R[0, 2] - R[2, 0]) / s
-            qx = (R[0, 1] + R[1, 0]) / s
-            qy = 0.25 * s
-            qz = (R[1, 2] + R[2, 1]) / s
-        else:
-            s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2  # s = 4 * qz
-            qw = (R[1, 0] - R[0, 1]) / s
-            qx = (R[0, 2] + R[2, 0]) / s
-            qy = (R[1, 2] + R[2, 1]) / s
-            qz = 0.25 * s
-        
-        return np.array([qw, qx, qy, qz])
+    
     
     def _store_image(self, image):
         """Store image in memory for batch saving."""

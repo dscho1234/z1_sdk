@@ -8,7 +8,7 @@ from gym import spaces
 
 # Add the lib directory to the path
 import unitree_arm_interface
-
+from scipy.spatial.transform import Rotation as R
 # Import the base class from z1_env
 sys.path.append(os.path.join(os.path.dirname(__file__)))
 from z1_env import Z1BaseEnv
@@ -305,7 +305,7 @@ class EEPoseCtrlLowCmdWrapper(Z1BaseEnv):
         position = T[:3, 3]
         
         # Extract quaternion from rotation matrix
-        quaternion = self._rotation_matrix_to_quaternion(T[:3, :3])
+        quaternion = R.from_matrix(T[:3, :3]).as_quat()
         
         # Get gripper position
         gripper_pos = self.current_gripper_pos if self.has_gripper else 0.0
@@ -322,36 +322,53 @@ class EEPoseCtrlLowCmdWrapper(Z1BaseEnv):
         T = self.arm_model.forwardKinematics(self.current_joint_pos, 6)
         return self._rotation_matrix_to_quaternion(T[:3, :3])
     
-    def _rotation_matrix_to_quaternion(self, R: np.ndarray) -> np.ndarray:
-        """Convert rotation matrix to quaternion."""
-        trace = np.trace(R)
+    
+    def _quaternion_to_rotation_matrix(self, q: np.ndarray) -> np.ndarray:
+        """Convert quaternion to 3x3 rotation matrix."""
+        # Normalize quaternion
+        q = self._normalize_quaternion(q)
+        w, x, y, z = q[0], q[1], q[2], q[3]
+        
+        # Convert to rotation matrix
+        R_matrix = np.array([
+            [1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
+            [2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+            [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
+        ])
+        
+        return R_matrix
+    
+    def _rotation_matrix_to_quaternion(self, R_matrix: np.ndarray) -> np.ndarray:
+        """Convert 3x3 rotation matrix to quaternion."""
+        # Shepperd's method for numerical stability
+        trace = np.trace(R_matrix)
         
         if trace > 0:
-            s = np.sqrt(trace + 1.0) * 2
-            w = 0.25 * s
-            x = (R[2, 1] - R[1, 2]) / s
-            y = (R[0, 2] - R[2, 0]) / s
-            z = (R[1, 0] - R[0, 1]) / s
-        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-            s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
-            w = (R[2, 1] - R[1, 2]) / s
-            x = 0.25 * s
-            y = (R[0, 1] + R[1, 0]) / s
-            z = (R[0, 2] + R[2, 0]) / s
-        elif R[1, 1] > R[2, 2]:
-            s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
-            w = (R[0, 2] - R[2, 0]) / s
-            x = (R[0, 1] + R[1, 0]) / s
-            y = 0.25 * s
-            z = (R[1, 2] + R[2, 1]) / s
+            s = np.sqrt(trace + 1.0) * 2  # s = 4 * qw
+            qw = 0.25 * s
+            qx = (R_matrix[2, 1] - R_matrix[1, 2]) / s
+            qy = (R_matrix[0, 2] - R_matrix[2, 0]) / s
+            qz = (R_matrix[1, 0] - R_matrix[0, 1]) / s
+        elif R_matrix[0, 0] > R_matrix[1, 1] and R_matrix[0, 0] > R_matrix[2, 2]:
+            s = np.sqrt(1.0 + R_matrix[0, 0] - R_matrix[1, 1] - R_matrix[2, 2]) * 2  # s = 4 * qx
+            qw = (R_matrix[2, 1] - R_matrix[1, 2]) / s
+            qx = 0.25 * s
+            qy = (R_matrix[0, 1] + R_matrix[1, 0]) / s
+            qz = (R_matrix[0, 2] + R_matrix[2, 0]) / s
+        elif R_matrix[1, 1] > R_matrix[2, 2]:
+            s = np.sqrt(1.0 + R_matrix[1, 1] - R_matrix[0, 0] - R_matrix[2, 2]) * 2  # s = 4 * qy
+            qw = (R_matrix[0, 2] - R_matrix[2, 0]) / s
+            qx = (R_matrix[0, 1] + R_matrix[1, 0]) / s
+            qy = 0.25 * s
+            qz = (R_matrix[1, 2] + R_matrix[2, 1]) / s
         else:
-            s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
-            w = (R[1, 0] - R[0, 1]) / s
-            x = (R[0, 2] + R[2, 0]) / s
-            y = (R[1, 2] + R[2, 1]) / s
-            z = 0.25 * s
+            s = np.sqrt(1.0 + R_matrix[2, 2] - R_matrix[0, 0] - R_matrix[1, 1]) * 2  # s = 4 * qz
+            qw = (R_matrix[1, 0] - R_matrix[0, 1]) / s
+            qx = (R_matrix[0, 2] + R_matrix[2, 0]) / s
+            qy = (R_matrix[1, 2] + R_matrix[2, 1]) / s
+            qz = 0.25 * s
         
-        return np.array([w, x, y, z])
+        return np.array([qw, qx, qy, qz])
     
     def _pose_to_transformation_matrix(self, position: np.ndarray, quaternion: np.ndarray) -> np.ndarray:
         """Convert position and quaternion to 4x4 transformation matrix."""
@@ -360,17 +377,6 @@ class EEPoseCtrlLowCmdWrapper(Z1BaseEnv):
         T[:3, 3] = position
         return T
     
-    def _quaternion_to_rotation_matrix(self, q: np.ndarray) -> np.ndarray:
-        """Convert quaternion to rotation matrix."""
-        w, x, y, z = q
-        
-        R = np.array([
-            [1 - 2*(y**2 + z**2), 2*(x*y - w*z), 2*(x*z + w*y)],
-            [2*(x*y + w*z), 1 - 2*(x**2 + z**2), 2*(y*z - w*x)],
-            [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x**2 + y**2)]
-        ])
-        
-        return R
     
     def _quaternion_distance(self, q1: np.ndarray, q2: np.ndarray) -> float:
         """Calculate distance between two quaternions."""

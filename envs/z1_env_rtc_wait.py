@@ -13,27 +13,39 @@ import functools
 # Add the lib directory to the path
 # sys.path.append(os.path.join(os.path.dirname(__file__), "..", "lib"))
 import unitree_arm_interface
+from scipy.spatial.transform import Rotation as R
 
 
-
-def _step_worker_thread(env_instance, action, result_container, step_ready):
-    """Worker function that executes a step in a separate thread."""
-    try:
-        # Execute the step logic in the thread
-        start = time.time()
-        print('start step execution in background thread')
-        result = env_instance._execute_step_logic(action)
-        result_container['result'] = result
-        result_container['completed'] = True
-        print(f"Step execution completed in background thread in {time.time() - start:.6f}s")
-    except Exception as e:
-        print(f"Error in step execution: {e}")
-        # Put a dummy result to unblock the system
-        dummy_result = (np.zeros(21), 0.0, False, {'error': str(e)})
-        result_container['result'] = dummy_result
-        result_container['completed'] = True
-    finally:
-        step_ready.set()
+def _step_worker_loop(env_instance):
+    """Worker loop that continuously processes step requests."""
+    while True:
+        try:
+            # Wait for step request
+            if hasattr(env_instance, 'step_request_event') and env_instance.step_request_event.wait():
+                env_instance.step_request_event.clear()
+                
+                # Check if we should stop (when close() is called)
+                if not hasattr(env_instance, 'is_initialized') or not env_instance.is_initialized:
+                    break
+                
+                # Execute the step logic
+                start = time.time()
+                print('start step execution in background thread')
+                result = env_instance._execute_step_logic(env_instance.pending_action)
+                env_instance.step_result_container['result'] = result
+                env_instance.step_result_container['completed'] = True
+                print(f"Step execution completed in background thread in {time.time() - start:.6f}s")
+                
+                # Signal completion
+                env_instance.step_ready.set()
+                
+        except Exception as e:
+            print(f"Error in step execution: {e}")
+            # Put a dummy result to unblock the system
+            dummy_result = (np.zeros(21), 0.0, False, {'error': str(e)})
+            env_instance.step_result_container['result'] = dummy_result
+            env_instance.step_result_container['completed'] = True
+            env_instance.step_ready.set()
 
 
 class Z1BaseEnv(gym.Env):
@@ -75,7 +87,7 @@ class Z1BaseEnv(gym.Env):
         self.action_space = None
         self.observation_space = None
         
-    def reset(self, joint_angle: Optional[np.ndarray] = None) -> np.ndarray:
+    def reset(self, joint_angle: Optional[np.ndarray] = None, option: str = "MoveJ") -> np.ndarray:
         """
         Reset the environment to initial state.
         
@@ -90,7 +102,7 @@ class Z1BaseEnv(gym.Env):
             if joint_angle is not None:
                 # Move to specified joint angles
                 print(f"Moving to specified joint angles: {joint_angle}")
-                self._move_to_joint_angles(joint_angle)
+                self._move_to_joint_angles(joint_angle, option=option)
             else:
                 self.arm.backToStart()
         else: # if not self.is_initialized:
@@ -109,7 +121,7 @@ class Z1BaseEnv(gym.Env):
             # If joint_angle is specified during initialization, move to it
             if joint_angle is not None:
                 print(f"Moving to specified joint angles during initialization: {joint_angle}")
-                self._move_to_joint_angles(joint_angle)
+                self._move_to_joint_angles(joint_angle, option=option)
             
             self.is_initialized = True
         
@@ -143,92 +155,132 @@ class Z1BaseEnv(gym.Env):
             self.current_gripper_pos = self.arm.lowstate.getGripperQ()
             self.current_gripper_vel = self.arm.gripperQd
     
-    def _move_to_joint_angles(self, target_joint_angles: np.ndarray):
+    def _move_to_joint_angles(self, target_joint_angles: np.ndarray, option: str = "MoveJ"):
         """
-        Move the robot to specified joint angles using low-level commands.
+        Move the robot to specified joint angles using either low-level commands or MoveJ.
         
         Args:
             target_joint_angles: Target joint angles (6-element array)
+            option: Movement method - "lowcmd" for low-level commands, "MoveJ" for high-level MoveJ
         """
         if len(target_joint_angles) != 6:
             raise ValueError(f"Expected 6 joint angles, got {len(target_joint_angles)}")
         
-        print(f"Moving to joint angles: {target_joint_angles}")
+        print(f"Moving to joint angles: {target_joint_angles} using {option} method")
         
-        # Set low-level command mode
-        self.arm.setFsmLowcmd()
-        
-        # Get current position as starting point
-        lastPos = np.array(self.arm.lowstate.getQ())
-        targetPos = target_joint_angles
-        
-        # Duration for smooth movement (about 2 seconds at 500Hz)
-        duration = 1000
-        
-        # Smooth interpolation to target position
-        for i in range(duration):
-            # Interpolate position
-            self.arm.q = lastPos * (1 - i/duration) + targetPos * (i/duration)
+        if option == "MoveJ":
+            # Use MoveJ high-level command (similar to example_highcmd_custom.py)
+            print("Using MoveJ high-level command...")
+            self.arm.setWait(True)
             
-            # Calculate velocity for smooth movement
-            self.arm.qd = (targetPos - lastPos) / (duration * self.arm._ctrlComp.dt)
+            # Convert target joint angles to transformation matrix
+            T_target = self.arm._ctrlComp.armModel.forwardKinematics(target_joint_angles, 6)
             
-            # Calculate torque using inverse dynamics
-            self.arm.tau = self.arm_model.inverseDynamics(
-                self.arm.q, self.arm.qd, np.zeros(6), np.zeros(6)
-            )
+            # Convert transformation matrix to posture (roll, pitch, yaw, x, y, z)
+            posture = unitree_arm_interface.homoToPosture(T_target)
             
-            # Set arm commands
-            self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
+            # Set gripper position (keep current gripper position)
+            gripper_pos = self.arm.lowstate.getGripperQ() if self.has_gripper else 0.0
+            jnt_speed = 1.0  # Joint speed (can be adjusted)
             
-            # Set gripper command (keep current gripper position)
-            if self.has_gripper:
-                self.arm.setGripperCmd(self.arm.gripperQ, self.arm.gripperQd, self.arm.gripperTau)
+            print(f"MoveJ to posture: {posture}, gripper: {gripper_pos}, speed: {jnt_speed}")
             
-            # Send commands
-            self.arm.sendRecv()
-            time.sleep(self.arm._ctrlComp.dt)
-        
-        print("Joint movement completed")
-        print("Target joint angles: ", target_joint_angles)
-        print("Current joint angles: ", np.array(self.arm.lowstate.getQ()))
-        
-        # Hold position for a moment to ensure stability
-        print("Holding position for stability...")
-        for _ in range(50):  # Hold for 0.1 seconds
-            # Keep sending the same position commands to maintain position
-            self.arm.setArmCmd(self.arm.q, np.zeros(6), self.arm.tau)
-            if self.has_gripper:
-                self.arm.setGripperCmd(self.arm.gripperQ, self.arm.gripperQd, self.arm.gripperTau)
-            self.arm.sendRecv()
-            time.sleep(self.arm._ctrlComp.dt)
-        
-        # Restart the sendRecv thread and switch back to proper FSM state
-        # This is crucial to prevent hanging after low-level commands
-        self.arm.loopOn()  # Restart sendRecvThread
-        
-        # Switch to JOINTCTRL state and maintain position
-        print("Switching to JOINTCTRL state...")
-        self.arm.setFsm(unitree_arm_interface.ArmFSMState.JOINTCTRL)
-        
-        # Immediately set the current position as target in JOINTCTRL mode
-        print("Setting current position as target in JOINTCTRL mode...")
-        current_joint_pos = np.array(self.arm.lowstate.getQ())
-        
-        # Set the arm to maintain current position
-        self.arm.q = current_joint_pos
-        self.arm.qd = np.zeros(6)  # Zero velocity
-        self.arm.tau = np.zeros(6)  # Zero torque initially
-        
-        # Send commands to maintain position
-        for _ in range(100):  # Send commands for 0.2 seconds
-            self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
-            if self.has_gripper:
-                self.arm.setGripperCmd(self.arm.gripperQ, self.arm.gripperQd, self.arm.gripperTau)
-            self.arm.sendRecv()
-            time.sleep(self.arm._ctrlComp.dt)
-        
-        print("Position maintained in JOINTCTRL mode")
+            # Send MoveJ command
+            success = self.arm.MoveJ(posture, gripper_pos, jnt_speed)
+            if success:
+                print("MoveJ command sent successfully")
+            else:
+                print("MoveJ command failed")
+            self.arm.setWait(False)
+                
+        else:  # option == "lowcmd" (default)
+            # Use low-level commands (original implementation)
+            print("Using low-level commands...")
+            
+            # Set low-level command mode
+            self.arm.setFsmLowcmd()
+            
+            # Get current position as starting point
+            lastPos = np.array(self.arm.lowstate.getQ())
+            targetPos = target_joint_angles
+
+            # Duration for smooth movement (about 2 seconds at 500Hz)
+            duration = 1000
+            
+            # Hold current position before starting movement
+            print("Holding current position before movement...")
+            for _ in range(100):  # Hold for 0.1 seconds
+                # Keep sending the same position commands to maintain current position
+                self.arm.setArmCmd(lastPos, np.zeros(6), np.zeros(6))
+                if self.has_gripper:
+                    self.arm.setGripperCmd(self.arm.gripperQ, self.arm.gripperQd, self.arm.gripperTau)
+                self.arm.sendRecv()
+                time.sleep(self.arm._ctrlComp.dt)
+            
+            # Smooth interpolation to target position
+            for i in range(duration):
+                # Interpolate position
+                self.arm.q = lastPos * (1 - i/duration) + targetPos * (i/duration)
+                
+                # Calculate velocity for smooth movement
+                self.arm.qd = (targetPos - lastPos) / (duration * self.arm._ctrlComp.dt)
+                
+                # Calculate torque using inverse dynamics
+                self.arm.tau = self.arm_model.inverseDynamics(
+                    self.arm.q, self.arm.qd, np.zeros(6), np.zeros(6)
+                )
+                
+                # Set arm commands
+                self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
+                
+                # Set gripper command (keep current gripper position)
+                if self.has_gripper:
+                    self.arm.setGripperCmd(self.arm.gripperQ, self.arm.gripperQd, self.arm.gripperTau)
+                
+                # Send commands
+                self.arm.sendRecv()
+                time.sleep(self.arm._ctrlComp.dt)
+            
+            print("Joint movement completed")
+            print("Target joint angles: ", target_joint_angles)
+            print("Current joint angles: ", np.array(self.arm.lowstate.getQ()))
+            
+            # Hold position for a moment to ensure stability
+            print("Holding position for stability...")
+            for _ in range(50):  # Hold for 0.1 seconds
+                # Keep sending the same position commands to maintain position
+                self.arm.setArmCmd(self.arm.q, np.zeros(6), self.arm.tau)
+                if self.has_gripper:
+                    self.arm.setGripperCmd(self.arm.gripperQ, self.arm.gripperQd, self.arm.gripperTau)
+                self.arm.sendRecv()
+                time.sleep(self.arm._ctrlComp.dt)
+            
+            # Restart the sendRecv thread and switch back to proper FSM state
+            # This is crucial to prevent hanging after low-level commands
+            self.arm.loopOn()  # Restart sendRecvThread
+            
+            # Switch to JOINTCTRL state and maintain position
+            print("Switching to JOINTCTRL state...")
+            self.arm.setFsm(unitree_arm_interface.ArmFSMState.JOINTCTRL)
+            
+            # Immediately set the current position as target in JOINTCTRL mode
+            print("Setting current position as target in JOINTCTRL mode...")
+            current_joint_pos = np.array(self.arm.lowstate.getQ())
+            
+            # Set the arm to maintain current position
+            self.arm.q = current_joint_pos
+            self.arm.qd = np.zeros(6)  # Zero velocity
+            self.arm.tau = np.zeros(6)  # Zero torque initially
+            
+            # Send commands to maintain position
+            for _ in range(100):  # Send commands for 0.2 seconds
+                self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
+                if self.has_gripper:
+                    self.arm.setGripperCmd(self.arm.gripperQ, self.arm.gripperQd, self.arm.gripperTau)
+                self.arm.sendRecv()
+                time.sleep(self.arm._ctrlComp.dt)
+            
+            print("Position maintained in JOINTCTRL mode")
         
     
     def _get_observation(self) -> np.ndarray:
@@ -260,6 +312,9 @@ class Z1BaseEnv(gym.Env):
             # Wait for step thread to finish if running
             if hasattr(self, 'step_thread') and self.step_thread and self.step_thread.is_alive():
                 print("Waiting for step thread to finish...")
+                # Signal the thread to stop by setting a stop flag
+                if hasattr(self, 'step_request_event'):
+                    self.step_request_event.set()  # This will cause the thread to exit
                 self.step_thread.join(timeout=1.0)
                 if self.step_thread.is_alive():
                     print("Warning: Step thread did not finish within timeout")
@@ -323,6 +378,9 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         self.step_thread = None
         self.step_result_container = {}
         self.step_ready = threading.Event()
+        self.step_thread_created = False
+        self.step_request_event = threading.Event()
+        self.pending_action = None
         
         # RTC-style future sequence handling
         self.current_sequence = None  # Current future target pose sequence
@@ -376,6 +434,8 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         self.arm.startTrack(unitree_arm_interface.ArmFSMState.CARTESIAN)
         print("Started cartesian control mode")
         
+        self.arm.setWait(False)
+
         # Set initial target to current end-effector pose
         self._update_state()
         current_ee_pose = self._get_current_ee_pose()
@@ -390,6 +450,20 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         
         # Reset previous directions flag for first step calculation
         self.has_previous_directions = False
+        
+        # Create step thread once during reset for reuse
+        if not self.step_thread_created:
+            self.step_thread = threading.Thread(
+                target=_step_worker_loop,
+                args=(self,),
+                daemon=True
+            )
+            self.step_thread_created = True
+            self.step_thread.start()
+            print("Created reusable step thread")
+        
+        # Initialize step ready event for first step
+        self.step_ready.set()  # Set initially so first step can proceed
         
         return self._get_observation()
     
@@ -409,12 +483,14 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
             done: Whether episode is done
             info: Additional information
         """
+        print('@@@@@@@@@@@@@ in step function, action :', action)
+
         if wait:
             # Blocking execution - execute step logic directly
             return self._execute_step_logic(action)
         else:
-            # Non-blocking execution - start step in background thread
-            if self.step_thread and self.step_thread.is_alive():
+            # Non-blocking execution - use reusable background thread
+            if not self.step_ready.is_set():
                 print("Warning: Step is already running in background. Ignoring new step request.")
                 # Return current state if step is already running
                 self._update_state()
@@ -428,13 +504,9 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
             self.step_result_container = {'result': None, 'completed': False}
             self.step_ready.clear()
             
-            # Start step execution in background thread
-            self.step_thread = threading.Thread(
-                target=_step_worker_thread,
-                args=(self, action, self.step_result_container, self.step_ready),
-                daemon=True
-            )
-            self.step_thread.start()
+            # Set pending action and signal the worker thread
+            self.pending_action = action
+            self.step_request_event.set()
             
             # Return immediately with current state
             self._update_state()
@@ -457,6 +529,7 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
             done: Whether episode is done
             info: Additional information
         """
+        print('@@@@@@@@@@@@@ in _execute_step_logic function, action :', action)
         # Update target pose from action
         self.target_position = action[:3]
         self.target_orientation = self._normalize_quaternion(action[3:7])
@@ -479,12 +552,21 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         
         # Calculate dt ratio for internal loop
         dt_ratio = int(self.dt / self.arm._ctrlComp.dt)
-        
+        start = time.time()
+        sleep_time_list = []
         # Execute cartesianCtrlCmd for dt_ratio iterations
         for i in range(dt_ratio):
             self.arm.cartesianCtrlCmd(cartesian_directions, self.angular_vel, self.linear_vel)
+            sleep_start = time.time()
             time.sleep(self.arm._ctrlComp.dt)
-        
+            sleep_time = time.time() - sleep_start
+            sleep_time_list.append(sleep_time)
+        cmd_time = time.time() - start
+        print("cmd time: ", cmd_time)
+        # print("sleep time mean:", np.array(sleep_time_list).mean())
+        # print("sleep time std: ", np.array(sleep_time_list).std())
+        # print("sleep time max: ", np.array(sleep_time_list).max())
+        # print("sleep time min: ", np.array(sleep_time_list).min())
         # Update state and get results
         self._update_state()
         observation = self._get_observation()
@@ -559,7 +641,7 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
     
     def is_step_complete(self) -> bool:
         """Check if the background step execution is complete."""
-        return self.step_thread is None or not self.step_thread.is_alive()
+        return self.step_ready.is_set()
     
     def get_step_result(self) -> Optional[Tuple[np.ndarray, float, bool, Dict[str, Any]]]:
         """
@@ -568,7 +650,7 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         Returns:
             Step result tuple if complete, None if still running or no result available
         """
-        if self.step_thread and self.step_thread.is_alive():
+        if not self.step_ready.is_set():
             return None  # Still running
         
         if self.step_result_container.get('completed', False):
@@ -591,28 +673,6 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         
         return observation.astype(np.float32)
     
-    def _get_reward(self) -> float:
-        """Calculate reward based on pose tracking accuracy."""
-        current_ee_pose = self._get_current_ee_pose()
-        current_pos = current_ee_pose[:3]
-        current_quat = current_ee_pose[3:7]
-        
-        # Position error reward
-        position_error = np.linalg.norm(self.target_position - current_pos)
-        position_reward = -position_error
-        
-        # Orientation error reward
-        orientation_error = self._quaternion_distance(self.target_orientation, current_quat)
-        orientation_reward = -orientation_error
-        
-        # Gripper reward
-        gripper_error = abs(self.target_gripper - self.current_gripper_pos) if self.has_gripper else 0.0
-        gripper_reward = -gripper_error
-        
-        # Total reward
-        total_reward = position_reward + 0.1 * orientation_reward + 0.1 * gripper_reward
-        
-        return total_reward
     
     def _is_done(self) -> bool:
         """Check if episode is done."""
@@ -639,10 +699,64 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         T = self.arm_model.forwardKinematics(self.current_joint_pos, 6)
         return T[:3, 3]
     
+    def _get_current_ee_se3(self, joint_pos = None) -> np.ndarray:
+        """Get current end-effector SE(3) matrix."""
+        if joint_pos is None:
+            joint_pos = self.current_joint_pos
+        T = self.arm_model.forwardKinematics(joint_pos, 6)
+        return T
+
     def _get_current_ee_orientation(self) -> np.ndarray:
         """Get current end-effector orientation as quaternion."""
         T = self.arm_model.forwardKinematics(self.current_joint_pos, 6)
         return self._rotation_matrix_to_quaternion(T[:3, :3])
+    
+    def _quaternion_to_rotation_matrix(self, q: np.ndarray) -> np.ndarray:
+        """Convert quaternion to 3x3 rotation matrix."""
+        # Normalize quaternion
+        q = self._normalize_quaternion(q)
+        w, x, y, z = q[0], q[1], q[2], q[3]
+        
+        # Convert to rotation matrix
+        R_matrix = np.array([
+            [1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
+            [2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+            [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
+        ])
+        
+        return R_matrix
+    
+    def _rotation_matrix_to_quaternion(self, R_matrix: np.ndarray) -> np.ndarray:
+        """Convert 3x3 rotation matrix to quaternion."""
+        # Shepperd's method for numerical stability
+        trace = np.trace(R_matrix)
+        
+        if trace > 0:
+            s = np.sqrt(trace + 1.0) * 2  # s = 4 * qw
+            qw = 0.25 * s
+            qx = (R_matrix[2, 1] - R_matrix[1, 2]) / s
+            qy = (R_matrix[0, 2] - R_matrix[2, 0]) / s
+            qz = (R_matrix[1, 0] - R_matrix[0, 1]) / s
+        elif R_matrix[0, 0] > R_matrix[1, 1] and R_matrix[0, 0] > R_matrix[2, 2]:
+            s = np.sqrt(1.0 + R_matrix[0, 0] - R_matrix[1, 1] - R_matrix[2, 2]) * 2  # s = 4 * qx
+            qw = (R_matrix[2, 1] - R_matrix[1, 2]) / s
+            qx = 0.25 * s
+            qy = (R_matrix[0, 1] + R_matrix[1, 0]) / s
+            qz = (R_matrix[0, 2] + R_matrix[2, 0]) / s
+        elif R_matrix[1, 1] > R_matrix[2, 2]:
+            s = np.sqrt(1.0 + R_matrix[1, 1] - R_matrix[0, 0] - R_matrix[2, 2]) * 2  # s = 4 * qy
+            qw = (R_matrix[0, 2] - R_matrix[2, 0]) / s
+            qx = (R_matrix[0, 1] + R_matrix[1, 0]) / s
+            qy = 0.25 * s
+            qz = (R_matrix[1, 2] + R_matrix[2, 1]) / s
+        else:
+            s = np.sqrt(1.0 + R_matrix[2, 2] - R_matrix[0, 0] - R_matrix[1, 1]) * 2  # s = 4 * qz
+            qw = (R_matrix[1, 0] - R_matrix[0, 1]) / s
+            qx = (R_matrix[0, 2] + R_matrix[2, 0]) / s
+            qy = (R_matrix[1, 2] + R_matrix[2, 1]) / s
+            qz = 0.25 * s
+        
+        return np.array([qw, qx, qy, qz])
     
     def _pose_to_transformation_matrix(self, position: np.ndarray, quaternion: np.ndarray) -> np.ndarray:
         """Convert position and quaternion to 4x4 transformation matrix."""
@@ -651,48 +765,7 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         T[:3, 3] = position
         return T
     
-    def _quaternion_to_rotation_matrix(self, q: np.ndarray) -> np.ndarray:
-        """Convert quaternion to rotation matrix."""
-        w, x, y, z = q
-        
-        R = np.array([
-            [1 - 2*(y**2 + z**2), 2*(x*y - w*z), 2*(x*z + w*y)],
-            [2*(x*y + w*z), 1 - 2*(x**2 + z**2), 2*(y*z - w*x)],
-            [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x**2 + y**2)]
-        ])
-        
-        return R
     
-    def _rotation_matrix_to_quaternion(self, R: np.ndarray) -> np.ndarray:
-        """Convert rotation matrix to quaternion."""
-        trace = np.trace(R)
-        
-        if trace > 0:
-            s = np.sqrt(trace + 1.0) * 2
-            w = 0.25 * s
-            x = (R[2, 1] - R[1, 2]) / s
-            y = (R[0, 2] - R[2, 0]) / s
-            z = (R[1, 0] - R[0, 1]) / s
-        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-            s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
-            w = (R[2, 1] - R[1, 2]) / s
-            x = 0.25 * s
-            y = (R[0, 1] + R[1, 0]) / s
-            z = (R[0, 2] + R[2, 0]) / s
-        elif R[1, 1] > R[2, 2]:
-            s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
-            w = (R[0, 2] - R[2, 0]) / s
-            x = (R[0, 1] + R[1, 0]) / s
-            y = 0.25 * s
-            z = (R[1, 2] + R[2, 1]) / s
-        else:
-            s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
-            w = (R[1, 0] - R[0, 1]) / s
-            x = (R[0, 2] + R[2, 0]) / s
-            y = (R[1, 2] + R[2, 1]) / s
-            z = 0.25 * s
-        
-        return np.array([w, x, y, z])
     
     def _normalize_quaternion(self, q: np.ndarray) -> np.ndarray:
         """Normalize quaternion to unit length."""

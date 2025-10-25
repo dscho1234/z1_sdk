@@ -2,8 +2,8 @@ import sys
 import os
 import numpy as np
 import time
-import multiprocessing as mp
 from multiprocessing import Process, Queue, Event
+import threading
 from typing import Tuple, Dict, Any, Optional, Callable
 import gym
 from gym import spaces
@@ -14,24 +14,36 @@ import functools
 import unitree_arm_interface
 from scipy.spatial.transform import Rotation as R
 
-def _inference_worker(inference_function, action_queue, inference_ready, sequence_length):
-    """Worker function that runs inference in a separate process."""
-    try:
-        # Call the actual inference function
-        start_inference = time.time()
-        new_sequence = inference_function()  # Should return [sequence_length, 8]
-        real_inference_time = time.time() - start_inference
-        print(f"Inference completed in {real_inference_time:.6f}s, generated sequence shape: {new_sequence.shape}")
-
-        # Put result in queue
-        action_queue.put(new_sequence)
-        print(f"Inference completed, new sequence queued with shape: {new_sequence.shape}")
-    except Exception as e:
-        print(f"Error in inference function: {e}")
-        # Put a dummy sequence to unblock the system
-        action_queue.put(np.zeros((sequence_length, 8)))
-    finally:
-        inference_ready.set()
+def _step_worker_loop(env_instance):
+    """Worker loop that continuously processes step requests."""
+    while True:
+        try:
+            # Wait for step request
+            if hasattr(env_instance, 'step_request_event') and env_instance.step_request_event.wait():
+                env_instance.step_request_event.clear()
+                
+                # Check if we should stop (when close() is called)
+                if not hasattr(env_instance, 'is_initialized') or not env_instance.is_initialized:
+                    break
+                
+                # Execute the step logic
+                start = time.time()
+                print('start step execution in background thread')
+                result = env_instance._execute_step_logic(env_instance.pending_action)
+                env_instance.step_result_container['result'] = result
+                env_instance.step_result_container['completed'] = True
+                print(f"Step execution completed in background thread in {time.time() - start:.6f}s")
+                
+                # Signal completion
+                env_instance.step_ready.set()
+                
+        except Exception as e:
+            print(f"Error in step execution: {e}")
+            # Put a dummy result to unblock the system
+            dummy_result = (np.zeros(21), 0.0, False, {'error': str(e)})
+            env_instance.step_result_container['result'] = dummy_result
+            env_instance.step_result_container['completed'] = True
+            env_instance.step_ready.set()
 
 
 class Z1BaseEnv(gym.Env):
@@ -287,6 +299,16 @@ class Z1BaseEnv(gym.Env):
                 if self.inference_process.is_alive():
                     self.inference_process.terminate()
             
+            # Wait for step thread to finish if running
+            if hasattr(self, 'step_thread') and self.step_thread and self.step_thread.is_alive():
+                print("Waiting for step thread to finish...")
+                # Signal the thread to stop by setting a stop flag
+                if hasattr(self, 'step_request_event'):
+                    self.step_request_event.set()  # This will cause the thread to exit
+                self.step_thread.join(timeout=1.0)
+                if self.step_thread.is_alive():
+                    print("Warning: Step thread did not finish within timeout")
+            
             self.arm.backToStart()
             self.arm.loopOff()
             self.is_initialized = False
@@ -342,6 +364,14 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         self.inference_process = None
         self.inference_ready = Event()
         
+        # Non-blocking step execution system using threading
+        self.step_thread = None
+        self.step_result_container = {}
+        self.step_ready = threading.Event()
+        self.step_thread_created = False
+        self.step_request_event = threading.Event()
+        self.pending_action = None
+        
         # RTC-style future sequence handling
         self.current_sequence = None  # Current future target pose sequence
         self.sequence_index = 0       # Current index in the sequence
@@ -394,6 +424,8 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         self.arm.startTrack(unitree_arm_interface.ArmFSMState.CARTESIAN)
         print("Started cartesian control mode")
         
+        self.arm.setWait(False)
+
         # Set initial target to current end-effector pose
         self._update_state()
         current_ee_pose = self._get_current_ee_pose()
@@ -409,36 +441,72 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         # Reset previous directions flag for first step calculation
         self.has_previous_directions = False
         
+        # Create step thread once during reset for reuse
+        if not self.step_thread_created:
+            self.step_thread = threading.Thread(
+                target=_step_worker_loop,
+                args=(self,),
+                daemon=True
+            )
+            self.step_thread_created = True
+            self.step_thread.start()
+            print("Created reusable step thread")
+        
+        # Initialize step ready event for first step
+        self.step_ready.set()  # Set initially so first step can proceed
+        
         return self._get_observation()
     
-    def non_blocking_inference(self, inference_function: Callable[[], np.ndarray], inference_time: float = 0.15, global_step = None):
-        start = time.time()
-        """
-        Start non-blocking inference that will return a future target pose sequence.
-        
-        Args:
-            inference_function: Function that returns a sequence of actions (shape: [sequence_length, 8])
-            inference_time: Expected inference time for timing calculations (seconds)
-        """
-        if self.inference_process and self.inference_process.is_alive():
-            print("Warning: Inference is already running. Ignoring new inference request.")
-            return
-        
-        # Start the inference process using the global worker function
-        self.inference_process = Process(
-            target=_inference_worker, 
-            args=(inference_function, self.action_queue, self.inference_ready, self.sequence_length),
-            daemon=True
-        )
-        self.inference_process.start()
-        
-        
     
-    
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+    def step(self, action: np.ndarray, wait: bool = True) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         """
         Execute one step with end-effector pose control using cartesianCtrlCmd.
         Simple version that just executes the given action for dt_ratio iterations.
+        
+        Args:
+            action: [x, y, z, qw, qx, qy, qz, gripper] target pose
+            wait: If True, wait for step to complete before returning. If False, execute step in background.
+            
+        Returns:
+            observation: Current observation
+            reward: Reward for this step
+            done: Whether episode is done
+            info: Additional information
+        """
+        if wait:
+            # Blocking execution - execute step logic directly
+            return self._execute_step_logic(action)
+        else:
+            # Non-blocking execution - use reusable background thread
+            if not self.step_ready.is_set():
+                print("Warning: Step is already running in background. Ignoring new step request.")
+                # Return current state if step is already running
+                self._update_state()
+                observation = self._get_observation()
+                reward = self._get_reward()
+                done = self._is_done()
+                info = {'fsm_state': self.arm.getCurrentState(), 'step_running': True}
+                return observation, reward, done, info
+            
+            # Reset result container and event
+            self.step_result_container = {'result': None, 'completed': False}
+            self.step_ready.clear()
+            
+            # Set pending action and signal the worker thread
+            self.pending_action = action
+            self.step_request_event.set()
+            
+            # Return immediately with current state
+            self._update_state()
+            observation = self._get_observation()
+            reward = self._get_reward()
+            done = self._is_done()
+            info = {'fsm_state': self.arm.getCurrentState(), 'step_running': True}
+            return observation, reward, done, info
+    
+    def _execute_step_logic(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        """
+        Execute the core step logic. This method contains the actual step execution code.
         
         Args:
             action: [x, y, z, qw, qx, qy, qz, gripper] target pose
@@ -449,7 +517,6 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
             done: Whether episode is done
             info: Additional information
         """
-        print('@@@@@@@@@@@@@ in step function, action :', action)
         # Update target pose from action
         self.target_position = action[:3]
         self.target_orientation = self._normalize_quaternion(action[3:7])
@@ -472,15 +539,21 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         
         # Calculate dt ratio for internal loop
         dt_ratio = int(self.dt / self.arm._ctrlComp.dt)
-        
-        # Execute cartesianCtrlCmd for dt_ratio iterations
         start = time.time()
+        sleep_time_list = []
+        # Execute cartesianCtrlCmd for dt_ratio iterations
         for i in range(dt_ratio):
             self.arm.cartesianCtrlCmd(cartesian_directions, self.angular_vel, self.linear_vel)
+            sleep_start = time.time()
             time.sleep(self.arm._ctrlComp.dt)
+            sleep_time = time.time() - sleep_start
+            sleep_time_list.append(sleep_time)
         cmd_time = time.time() - start
-        print(f"cartesianCtrlCmd time: {cmd_time}")
-        
+        print("cmd time: ", cmd_time)
+        print("sleep time mean:", np.array(sleep_time_list).mean())
+        print("sleep time std: ", np.array(sleep_time_list).std())
+        print("sleep time max: ", np.array(sleep_time_list).max())
+        print("sleep time min: ", np.array(sleep_time_list).min())
         # Update state and get results
         self._update_state()
         observation = self._get_observation()
@@ -553,6 +626,25 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         """Check if there's a sequence available and not exhausted."""
         return self.current_sequence is not None and self.sequence_index < len(self.current_sequence)
     
+    def is_step_complete(self) -> bool:
+        """Check if the background step execution is complete."""
+        return self.step_ready.is_set()
+    
+    def get_step_result(self) -> Optional[Tuple[np.ndarray, float, bool, Dict[str, Any]]]:
+        """
+        Get the result from the background step execution if it's complete.
+        
+        Returns:
+            Step result tuple if complete, None if still running or no result available
+        """
+        if not self.step_ready.is_set():
+            return None  # Still running
+        
+        if self.step_result_container.get('completed', False):
+            return self.step_result_container.get('result', None)
+        
+        return None
+    
     def _get_observation(self) -> np.ndarray:
         """Get current observation including joint states and end-effector pose."""
         current_ee_pose = self._get_current_ee_pose()
@@ -568,28 +660,6 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         
         return observation.astype(np.float32)
     
-    def _get_reward(self) -> float:
-        """Calculate reward based on pose tracking accuracy."""
-        current_ee_pose = self._get_current_ee_pose()
-        current_pos = current_ee_pose[:3]
-        current_quat = current_ee_pose[3:7]
-        
-        # Position error reward
-        position_error = np.linalg.norm(self.target_position - current_pos)
-        position_reward = -position_error
-        
-        # Orientation error reward
-        orientation_error = self._quaternion_distance(self.target_orientation, current_quat)
-        orientation_reward = -orientation_error
-        
-        # Gripper reward
-        gripper_error = abs(self.target_gripper - self.current_gripper_pos) if self.has_gripper else 0.0
-        gripper_reward = -gripper_error
-        
-        # Total reward
-        total_reward = position_reward + 0.1 * orientation_reward + 0.1 * gripper_reward
-        
-        return total_reward
     
     def _is_done(self) -> bool:
         """Check if episode is done."""
@@ -615,13 +685,6 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         """Get current end-effector position."""
         T = self.arm_model.forwardKinematics(self.current_joint_pos, 6)
         return T[:3, 3]
-    
-    def _get_current_ee_se3(self, joint_pos = None) -> np.ndarray:
-        """Get current end-effector SE(3) matrix."""
-        if joint_pos is None:
-            joint_pos = self.current_joint_pos
-        T = self.arm_model.forwardKinematics(joint_pos, 6)
-        return T
     
     def _get_current_ee_orientation(self) -> np.ndarray:
         """Get current end-effector orientation as quaternion."""
