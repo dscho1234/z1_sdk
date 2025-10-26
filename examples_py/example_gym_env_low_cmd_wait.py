@@ -359,6 +359,8 @@ def main():
                 # Use previous observation if no result
                 pass
             
+            
+
             # Print gripper state
             gripper_state = obs[19] if len(obs) > 19 else 0.0
             print(f"Step {step}: Gripper State = {gripper_state:.3f}")

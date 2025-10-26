@@ -45,15 +45,29 @@ def _step_worker_loop(env_instance):
                 if not hasattr(env_instance, 'is_initialized') or not env_instance.is_initialized:
                     break
                 
+                # Check if we should interrupt current step
+                if hasattr(env_instance, 'interrupt_event') and env_instance.interrupt_event.is_set():
+                    env_instance.interrupt_event.clear()
+                    print("Step interrupted by new request")
+                    # Signal completion even when interrupted to unblock main thread
+                    env_instance.step_ready.set()
+                    continue
+                
                 # Execute the step logic
                 start = time.time()
                 # print('start step execution in background thread')
                 result = env_instance._execute_step_logic(env_instance.pending_action)
-                env_instance.step_result_container['result'] = result
-                env_instance.step_result_container['completed'] = True
-                print(f"Step execution completed in background thread in {time.time() - start:.6f}s")
                 
-                # Signal completion
+                # Only store result if step completed successfully (not interrupted)
+                if result is not None:
+                    env_instance.step_result_container['result'] = result
+                    env_instance.step_result_container['completed'] = True
+                    print(f"Step: {env_instance.num_steps_executed} execution completed in background thread in {time.time() - start:.6f}s")
+                else:
+                    # Step was interrupted, don't store result
+                    print(f"Step: {env_instance.num_steps_executed} execution interrupted in background thread after {time.time() - start:.6f}s")
+                
+                # Signal completion regardless of success or interruption
                 env_instance.step_ready.set()
                 
         except Exception as e:
@@ -139,7 +153,7 @@ class Z1BaseEnv(gym.Env):
             time.sleep(0.1)  # Small delay for initialization
             
             # dscho added
-            # self.arm.labelRun("forward")
+            self.arm.labelRun("forward")
             
             # Skip backToStart for now to avoid hanging
             print("Skipping backToStart() to avoid potential hanging...")
@@ -500,7 +514,12 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         self.step_ready = threading.Event()
         self.step_thread_created = False
         self.step_request_event = threading.Event()
+        self.interrupt_event = threading.Event()
         self.pending_action = None
+        
+        # Timing control for precise control frequency
+        self.step_start_time = None
+        self.step_timeout = 1.0 / control_frequency  # Timeout for each step
         
         # RTC-style future sequence handling
         self.current_sequence = None  # Current future target pose sequence
@@ -511,7 +530,10 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         self.target_position = np.zeros(3)
         self.target_orientation = np.array([0, 0, 0, 1])  # x, y, z, w quaternion (identity)
         self.target_gripper = 0.0
-        
+        self.num_steps_executed = 0
+        self.num_steps_interrupted = 0
+        self.num_steps_interrupted_in_execute_step_logic = 0
+        self.num_steps_interrupted_in_wait_for_step_with_timeout = 0
         # Define action space: [x, y, z, qx, qy, qz, qw, gripper] (8D)
         # Position: [-1, 1] meters, Orientation: [-1, 1] quaternion [x,y,z,w], Gripper: [-1, 1]
         self.action_space = spaces.Box(
@@ -548,7 +570,6 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             joint_angle: Optional joint angles to move to. If None, uses default reset behavior.
                         Should be a 6-element array for 6-DOF arm.
         """
-        assert joint_angle is not None, "joint_angle must be provided for stable initialization"
         super().reset(joint_angle, option=option)
         
         # Set low-level command mode (like example_lowcmd.py)
@@ -602,6 +623,8 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             info: Additional information
         """
         
+        # Record step start time for timing control
+        self.step_start_time = time.time()
 
         if wait:
             # Blocking execution - execute step logic directly
@@ -609,14 +632,12 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         else:
             # Non-blocking execution - use reusable background thread
             if not self.step_ready.is_set():
-                print("Warning: Step is already running in background. Ignoring new step request.")
-                # Return current state if step is already running
-                self._update_state()
-                observation = self._get_observation()
-                reward = self._get_reward()
-                done = self._is_done()
-                info = {'fsm_state': self.arm.getCurrentState(), 'step_running': True}
-                return observation, reward, done, info
+                print(f"Warning: Step is already running in background. Interrupting previous step. Num steps interrupted: {self.num_steps_interrupted}")
+                self.num_steps_interrupted += 1
+                # Interrupt previous step
+                self.interrupt_event.set()
+                # Wait a bit for interrupt to take effect
+                time.sleep(0.01)
             
             # Reset result container and event
             self.step_result_container = {'result': None, 'completed': False}
@@ -647,7 +668,8 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             done: Whether episode is done
             info: Additional information
         """
-        print('@@@@@@@@@@@@@ in _execute_step_logic function, action :', action)
+        print(f'@@@@@@@@@@@@@ in _execute_step_logic function, action : {action} , num_steps_executed : {self.num_steps_executed}')
+        self.num_steps_executed += 1
         
         # Update target pose from action
         self.target_position = action[:3]
@@ -674,7 +696,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             initial_guess=current_joint_pos,
             max_iterations=20, 
             tolerance=1e-2, 
-            tolerance_null=1e-3
+            tolerance_null=1e-4
         )
         ik_time = time.time() - ik_start
         print(f"IK result: success={ik_success}, iterations={ik_iterations}, error={ik_error:.6f}, null_obj_val={null_obj_val:.6f}, time={ik_time:.6f}s")
@@ -682,7 +704,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         
         if not ik_success:
             print("Warning: IK failed, using current joint angles")
-            
+            target_joint_angles = current_joint_pos.copy()
         
         # Execute joint movement using dt_ratio approach (like z1_env_rtc_wait_R.py)
         print("Executing joint movement...")
@@ -693,8 +715,17 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         dt_ratio = int(self.dt / self.arm._ctrlComp.dt)
         start = time.time()
         
+        
         # Execute smooth interpolation to target position for dt_ratio iterations
         for i in range(dt_ratio):
+            # Check for interrupt
+            if hasattr(self, 'interrupt_event') and self.interrupt_event.is_set():
+                print(f"Step execution interrupted during joint movement. Num steps interrupted in execute step logic: {self.num_steps_interrupted_in_execute_step_logic}")
+                self.num_steps_interrupted_in_execute_step_logic += 1
+                # self.interrupt_event.clear()
+                # Just clear the interrupt and let wait_for_step_with_timeout handle the result
+                return None  # Signal that step was interrupted
+            
             # Interpolate position
             self.arm.q = lastPos * (1 - i/dt_ratio) + targetPos * (i/dt_ratio)
             
@@ -823,9 +854,79 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             return None  # Still running
         
         if self.step_result_container.get('completed', False):
-            return self.step_result_container.get('result', None)
+            result = self.step_result_container.get('result', None)
+            if result is not None:
+                return result
+            else:
+                # Step was interrupted, return None to let wait_for_step_with_timeout handle it
+                return None
         
         return None
+    
+    def wait_for_step_with_timeout(self, timeout: float = None) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        """
+        Wait for step completion with timeout control based on step start time.
+        
+        Args:
+            timeout: Maximum time to wait. If None, uses step_timeout.
+            
+        Returns:
+            Step result tuple (always returns a valid result, either completed or timeout)
+        """
+        if timeout is None:
+            timeout = self.step_timeout
+        
+        # Calculate remaining time based on step start time
+        if self.step_start_time is not None:
+            elapsed_time = time.time() - self.step_start_time
+            remaining_time = max(0, timeout - elapsed_time)
+        else:
+            remaining_time = timeout
+        print(f"Remaining time: {remaining_time:.3f}s")
+        # Wait for step completion or timeout
+        if remaining_time > 0 and self.step_ready.wait(remaining_time):
+            result = self.get_step_result()
+            if result is not None:
+                return result
+        
+        # If we reach here, either timeout occurred or step was interrupted
+        print(f"Step timeout exceeded ({timeout:.3f}s), interrupting... Num steps interrupted in wait for step with timeout: {self.num_steps_interrupted_in_wait_for_step_with_timeout}")
+        self.num_steps_interrupted_in_wait_for_step_with_timeout += 1
+        # self.interrupt_event.set()
+        
+        # Return current state with complete info even on timeout
+        self._update_state()
+        observation = self._get_observation()
+        reward = self._get_reward()
+        done = self._is_done()
+        
+        # Calculate current errors for complete info
+        current_ee_pose = self._get_current_ee_pose()
+        position_error = np.linalg.norm(self.target_position - current_ee_pose[:3])
+        orientation_error = self._quaternion_distance(
+            self.target_orientation, current_ee_pose[3:7]
+        )
+        
+        info = {
+            'fsm_state': self.arm.getCurrentState(),
+            'target_position': self.target_position.copy(),
+            'target_orientation': self.target_orientation.copy(),
+            'current_ee_pose': current_ee_pose,
+            'position_error': position_error,
+            'orientation_error': orientation_error,
+            'target_joint_angles': self.current_joint_pos.copy(),  # Use current as target on timeout
+            'current_joint_angles': self.current_joint_pos.copy(),
+            'ik_success': False,  # Assume failed on timeout
+            'ik_iterations': 0,
+            'ik_error': position_error,
+            'null_obj_val': 0.0,
+            'dt_ratio': 0,
+            'cmd_time': timeout,
+            'timeout': True,
+            'interrupted': True
+        }
+        
+        return observation, reward, done, info
     
     def _get_observation(self) -> np.ndarray:
         """Get current observation including joint states and end-effector pose."""

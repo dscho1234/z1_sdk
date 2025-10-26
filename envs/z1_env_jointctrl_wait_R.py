@@ -100,10 +100,6 @@ class Z1BaseEnv(gym.Env):
         self.episode_step = 0
         self.max_episode_steps = 1000
         
-        # Define action and observation spaces (to be overridden by subclasses)
-        self.action_space = None
-        self.observation_space = None
-        
         # Joint limits for IK
         self.joint_limits = [
             (-2.618, 2.618),   # J1: ±150°
@@ -113,6 +109,10 @@ class Z1BaseEnv(gym.Env):
             (-1.484, 1.484),   # J5: ±85°
             (-2.793, 2.793)    # J6: ±160°
         ]
+        
+        # Define action and observation spaces (to be overridden by subclasses)
+        self.action_space = None
+        self.observation_space = None
         
     def reset(self, joint_angle: Optional[np.ndarray] = None, option: str = "lowcmd") -> np.ndarray:
         """
@@ -314,111 +314,6 @@ class Z1BaseEnv(gym.Env):
         """Get current observation (to be implemented by subclasses)."""
         raise NotImplementedError("Subclasses must implement _get_observation method")
     
-    def _get_current_ee_se3(self, joint_pos=None) -> np.ndarray:
-        """Get current end-effector SE(3) matrix."""
-        if joint_pos is None:
-            joint_pos = self.current_joint_pos
-        T = self.arm_model.forwardKinematics(joint_pos, 6)
-        return T
-    
-    def jacobian_position(self, q):
-        """Calculate position Jacobian using numerical differentiation."""
-        epsilon = 1e-6
-        epsilon_inv = 1/epsilon
-        T = self._get_current_ee_se3(joint_pos=q)
-        p = T[:3, 3]
-        jac = np.zeros([3, 6])
-        for i in range(6):
-            q_ = q.copy()
-            q_[i] = q_[i] + epsilon
-            T_ = self._get_current_ee_se3(joint_pos=q_)
-            p_ = T_[:3, 3]
-            jac[:, i] = (p_ - p)*epsilon_inv
-        return jac
-    
-    def solve_ik_null_space(self, target_T, initial_guess=None, max_iterations=100, tolerance=1e-2, tolerance_null=1e-5, epsilon=1e-6):
-        """
-        Solve IK using pseudo-inverse with null-space approach.
-        
-        Args:
-            target_T: Target 4x4 transformation matrix
-            initial_guess: Initial joint angle guess
-            max_iterations: Maximum number of iterations
-            tolerance: Convergence tolerance for position error
-            tolerance_null: Convergence tolerance for null objective
-            epsilon: Small value for numerical differentiation
-            
-        Returns:
-            tuple: (success, joint_angles, iterations, final_error, null_obj_val)
-        """
-        if initial_guess is None:
-            initial_guess = np.zeros(6)
-        
-        q = initial_guess.copy()
-        
-        # Initialize null objective with desired rotation (default: identity)
-        target_SO3 = target_T[:3, :3]
-        null_obj = SO3Constraint(target_SO3)
-        
-        iter_taken = 0
-        
-        while True:
-            # Compute current forward kinematics
-            current_T = self._get_current_ee_se3(joint_pos=q)
-            
-            # Compute position error only (like in the original code)
-            pos_error = target_T[:3, 3] - current_T[:3, 3]
-            err = np.linalg.norm(pos_error)
-            
-            # Compute null objective value
-            current_SO3 = current_T[:3, :3]
-            null_obj_val = null_obj.evaluate(current_SO3)
-
-            # Compute Jacobian
-            J = self.jacobian_position(q)
-            
-            # Check convergence: both position error and null objective must be satisfied
-            if (err < tolerance and null_obj_val < tolerance_null) or iter_taken >= max_iterations:
-                break
-            else:
-                iter_taken += 1
-            
-            # Pseudo-inverse approach
-            J_dagger = np.linalg.pinv(J)
-            J_null = np.eye(6) - J_dagger @ J  # null space of Jacobian
-            
-            # Compute null objective gradient using numerical differentiation
-            phi = np.zeros(6)
-            
-            for i in range(6):
-                q_perturb = q.copy()
-                q_perturb[i] += epsilon
-                # Apply joint limits to perturbed configuration
-                q_perturb = np.clip(q_perturb, [limit[0] for limit in self.joint_limits], [limit[1] for limit in self.joint_limits])
-                
-                perturb_T = self._get_current_ee_se3(joint_pos=q_perturb)
-                perturb_SO3 = perturb_T[:3, :3]
-                null_obj_val_perturb = null_obj.evaluate(perturb_SO3)
-                phi[i] = (null_obj_val_perturb - null_obj_val) / epsilon
-            
-            # Update using pseudo-inverse + null-space approach
-            # delta_x = ee_pos - x (position error)
-            delta_x = pos_error
-            delta_q = J_dagger @ delta_x - J_null @ phi
-            q = q + delta_q
-            
-            # Apply joint limits
-            q = np.clip(q, [limit[0] for limit in self.joint_limits], [limit[1] for limit in self.joint_limits])
-        
-        # Final error check (position error only, like in original code)
-        current_T = self._get_current_ee_se3(joint_pos=q)
-        final_error = err  # np.linalg.norm(final_pos_error)
-        
-        # Check if both conditions are satisfied for success
-        success = (final_error < tolerance and null_obj_val < tolerance_null)
-        
-        return success, q, iter_taken, final_error, null_obj_val
-    
     def _get_reward(self) -> float:
         """Calculate reward for current state (to be implemented by subclasses)."""
         return 0.0
@@ -460,9 +355,9 @@ class Z1BaseEnv(gym.Env):
 
 class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
     """
-    End-effector pose control wrapper for Z1 robot using joint-level commands with IK.
-    This wrapper allows controlling the robot's end-effector pose by solving IK and using low-level joint commands
-    similar to example_lowcmd.py, with support for future target pose sequences from inference.
+    End-effector pose control wrapper for Z1 robot using jointCtrlCmd with RTC-style future sequence handling.
+    This wrapper allows controlling the robot's end-effector pose by converting target poses to joint commands
+    using jointCtrlCmd with support for future target pose sequences from inference.
     """
     
     def __init__(self, 
@@ -470,16 +365,18 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
                  control_frequency: float = 500.0,
                  position_tolerance: float = 0.01,
                  orientation_tolerance: float = 0.1,
+                 joint_speed: float = 1.0,
                  sequence_length: int = 10,
                  ):
         """
-        Initialize the end-effector pose control wrapper using joint commands with IK.
+        Initialize the end-effector pose control wrapper using joint commands with RTC support.
         
         Args:
             has_gripper: Whether the robot has a gripper
             control_frequency: Control frequency in Hz
             position_tolerance: Position tolerance for convergence
             orientation_tolerance: Orientation tolerance for convergence
+            joint_speed: Joint speed for jointCtrlCmd commands (range: [0, π])
             sequence_length: Length of future target pose sequences from inference
             
         """
@@ -487,7 +384,12 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         
         self.position_tolerance = position_tolerance
         self.orientation_tolerance = orientation_tolerance
+        self.joint_speed = joint_speed
         self.sequence_length = sequence_length
+        
+        # Store previous step's joint directions for continuous movement during inference
+        self.previous_joint_directions = np.zeros(7)  # [J1, J2, J3, J4, J5, J6, gripper]
+        self.has_previous_directions = False
         
         # Non-blocking inference system using multiprocessing
         self.action_queue = Queue()
@@ -551,11 +453,11 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         assert joint_angle is not None, "joint_angle must be provided for stable initialization"
         super().reset(joint_angle, option=option)
         
-        # Set low-level command mode (like example_lowcmd.py)
-        self.arm.setFsmLowcmd()
-        print("Started low-level command mode")
+        # Start joint control mode
+        self.arm.startTrack(unitree_arm_interface.ArmFSMState.JOINTCTRL)
+        print("Started joint control mode")
         
-        # self.arm.setWait(False)
+        self.arm.setWait(False)
 
         # Set initial target to current end-effector pose
         self._update_state()
@@ -568,6 +470,9 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         self.current_sequence = None
         self.sequence_index = 0
         self.sequence_step_count = 0
+        
+        # Reset previous directions flag for first step calculation
+        self.has_previous_directions = False
         
         # Create step thread once during reset for reuse
         if not self.step_thread_created:
@@ -588,8 +493,8 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
     
     def step(self, action: np.ndarray, wait: bool = True) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         """
-        Execute one step with end-effector pose control using joint commands with IK.
-        Converts target pose to joint angles using IK and executes low-level joint commands.
+        Execute one step with end-effector pose control using jointCtrlCmd.
+        Converts target pose to joint commands and executes them.
         
         Args:
             action: [x, y, z, qx, qy, qz, qw, gripper] target pose (quaternion in [x,y,z,w] format)
@@ -636,7 +541,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
     
     def _execute_step_logic(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         """
-        Execute the core step logic using joint commands with IK (like example_lowcmd.py).
+        Execute the core step logic. This method contains the actual step execution code.
         
         Args:
             action: [x, y, z, qx, qy, qz, qw, gripper] target pose (quaternion in [x,y,z,w] format)
@@ -648,8 +553,8 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             info: Additional information
         """
         print('@@@@@@@@@@@@@ in _execute_step_logic function, action :', action)
-        
         # Update target pose from action
+        # action format: [x, y, z, qx, qy, qz, qw, gripper]
         self.target_position = action[:3]
         self.target_orientation = self._normalize_quaternion(action[3:7])  # [qx, qy, qz, qw]
         if self.has_gripper:
@@ -657,105 +562,58 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         
         # Get current state
         self._update_state()
-        current_joint_pos = self.current_joint_pos.copy()
-
-        # for debug
         current_ee_pose = self._get_current_ee_pose()
         current_ee_pose_before_cmd = current_ee_pose.copy()
+        current_pos = current_ee_pose[:3]
+        current_quat = current_ee_pose[3:7]
+        current_gripper_pos = current_ee_pose[7] if self.has_gripper else 0.0
         
-        # Convert target pose to transformation matrix
-        target_T = self._pose_to_transformation_matrix(self.target_position, self.target_orientation)
+        # Calculate joint directions to target pose
+        joint_directions, actual_joint_speed, gripper_speed = \
+            self._calculate_joint_directions(
+                self.target_position, self.target_orientation, self.target_gripper,
+                current_pos, current_quat, current_gripper_pos, self.dt
+            )
+        print(f'joint_directions : {joint_directions}')
+        print(f'actual_joint_speed : {actual_joint_speed}')
         
-        # Solve IK to get target joint angles
-        print("Solving IK for target pose...")
-        ik_start = time.time()
-        ik_success, target_joint_angles, ik_iterations, ik_error, null_obj_val = self.solve_ik_null_space(
-            target_T, 
-            initial_guess=current_joint_pos,
-            max_iterations=20, 
-            tolerance=1e-2, 
-            tolerance_null=1e-3
-        )
-        ik_time = time.time() - ik_start
-        print(f"IK result: success={ik_success}, iterations={ik_iterations}, error={ik_error:.6f}, null_obj_val={null_obj_val:.6f}, time={ik_time:.6f}s")
-        print(f"Target joint angles: {target_joint_angles}")
-        
-        if not ik_success:
-            print("Warning: IK failed, using current joint angles")
-            
-        
-        # Execute joint movement using dt_ratio approach (like z1_env_rtc_wait_R.py)
-        print("Executing joint movement...")
-        lastPos = current_joint_pos.copy()
-        targetPos = target_joint_angles
-        
-        # Calculate dt ratio for internal loop (like z1_env_rtc_wait_R.py)
+        # Calculate dt ratio for internal loop
         dt_ratio = int(self.dt / self.arm._ctrlComp.dt)
         start = time.time()
-        
-        # Execute smooth interpolation to target position for dt_ratio iterations
+        sleep_time_list = []
+        # Execute jointCtrlCmd for dt_ratio iterations
         for i in range(dt_ratio):
-            # Interpolate position
-            self.arm.q = lastPos * (1 - i/dt_ratio) + targetPos * (i/dt_ratio)
-            
-            # Calculate velocity for smooth movement
-            self.arm.qd = (targetPos - lastPos) / (dt_ratio * self.arm._ctrlComp.dt)
-            
-            # Calculate torque using inverse dynamics
-            self.arm.tau = self.arm_model.inverseDynamics(
-                self.arm.q, self.arm.qd, np.zeros(6), np.zeros(6)
-            )
-            
-            # Set arm commands
-            self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
-            
-            # Set gripper command
-            if self.has_gripper:
-                # Interpolate gripper position
-                current_gripper = self.current_gripper_pos
-                target_gripper = self.target_gripper
-                gripper_pos = current_gripper * (1 - i/dt_ratio) + target_gripper * (i/dt_ratio)
-                gripper_vel = (target_gripper - current_gripper) / (dt_ratio * self.arm._ctrlComp.dt)
-                gripper_tau = 0.0  # No torque control for gripper
-                
-                self.arm.setGripperCmd(gripper_pos, gripper_vel, gripper_tau)
-            
-            # Send commands
-            self.arm.sendRecv()
+            self.arm.jointCtrlCmd(joint_directions, self.joint_speed)
+            sleep_start = time.time()
             time.sleep(self.arm._ctrlComp.dt)
-        
+            sleep_time = time.time() - sleep_start
+            sleep_time_list.append(sleep_time)
         cmd_time = time.time() - start
-        print(f"Joint movement completed in {cmd_time:.6f}s (dt_ratio={dt_ratio})")
-        
+        # print("cmd time: ", cmd_time)
+        # print("sleep time mean:", np.array(sleep_time_list).mean())
+        # print("sleep time std: ", np.array(sleep_time_list).std())
+        # print("sleep time max: ", np.array(sleep_time_list).max())
+        # print("sleep time min: ", np.array(sleep_time_list).min())
         # Update state and get results
         self._update_state()
         observation = self._get_observation()
         reward = self._get_reward()
         done = self._is_done()
         
-        # Calculate final errors
-        current_ee_pose = self._get_current_ee_pose()
-        position_error = np.linalg.norm(self.target_position - current_ee_pose[:3])
-        orientation_error = self._quaternion_distance(
-            self.target_orientation, current_ee_pose[3:7]
-        )
-        
         # Create info dictionary
         info = {
             'fsm_state': self.arm.getCurrentState(),
             'target_position': self.target_position.copy(),
             'target_orientation': self.target_orientation.copy(),
-            'current_ee_pose': current_ee_pose,
-            'position_error': position_error,
-            'orientation_error': orientation_error,
-            'target_joint_angles': target_joint_angles.copy(),
-            'current_joint_angles': self.current_joint_pos.copy(),
-            'ik_success': ik_success,
-            'ik_iterations': ik_iterations,
-            'ik_error': ik_error,
-            'null_obj_val': null_obj_val,
+            'current_ee_pose': self._get_current_ee_pose(),
+            'position_error': np.linalg.norm(self.target_position - self._get_current_ee_position()),
+            'orientation_error': self._quaternion_distance(
+                self.target_orientation, self._get_current_ee_orientation()
+            ),
+            'joint_directions': joint_directions.copy(),
+            'actual_joint_speed': actual_joint_speed,
+            'gripper_speed': gripper_speed,
             'dt_ratio': dt_ratio,
-            'cmd_time': cmd_time,
             'current_ee_pose_before_cmd': current_ee_pose_before_cmd.copy(),
         }
         
@@ -874,6 +732,104 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             joint_pos = self.current_joint_pos
         T = self.arm_model.forwardKinematics(joint_pos, 6)
         return T
+    
+    def jacobian_position(self, q):
+        """Calculate position Jacobian using numerical differentiation."""
+        epsilon = 1e-6
+        epsilon_inv = 1/epsilon
+        T = self._get_current_ee_se3(joint_pos=q)
+        p = T[:3, 3]
+        jac = np.zeros([3, 6])
+        for i in range(6):
+            q_ = q.copy()
+            q_[i] = q_[i] + epsilon
+            T_ = self._get_current_ee_se3(joint_pos=q_)
+            p_ = T_[:3, 3]
+            jac[:, i] = (p_ - p)*epsilon_inv
+        return jac
+    
+    def solve_ik_null_space(self, target_T, initial_guess=None, max_iterations=100, tolerance=1e-2, tolerance_null=1e-5, epsilon=1e-6):
+        """
+        Solve IK using pseudo-inverse with null-space approach.
+        
+        Args:
+            target_T: Target 4x4 transformation matrix
+            initial_guess: Initial joint angle guess
+            max_iterations: Maximum number of iterations
+            tolerance: Convergence tolerance for position error
+            tolerance_null: Convergence tolerance for null objective
+            epsilon: Small value for numerical differentiation
+            
+        Returns:
+            tuple: (success, joint_angles, iterations, final_error, null_obj_val)
+        """
+        if initial_guess is None:
+            initial_guess = np.zeros(6)
+        
+        q = initial_guess.copy()
+        
+        # Initialize null objective with desired rotation (default: identity)
+        target_SO3 = target_T[:3, :3]
+        null_obj = SO3Constraint(target_SO3)
+        
+        iter_taken = 0
+        
+        while True:
+            # Compute current forward kinematics
+            current_T = self._get_current_ee_se3(joint_pos=q)
+            
+            # Compute position error only (like in the original code)
+            pos_error = target_T[:3, 3] - current_T[:3, 3]
+            err = np.linalg.norm(pos_error)
+            
+            # Compute null objective value
+            current_SO3 = current_T[:3, :3]
+            null_obj_val = null_obj.evaluate(current_SO3)
+
+            # Compute Jacobian
+            J = self.jacobian_position(q)
+            
+            # Check convergence: both position error and null objective must be satisfied
+            if (err < tolerance and null_obj_val < tolerance_null) or iter_taken >= max_iterations:
+                break
+            else:
+                iter_taken += 1
+            
+            # Pseudo-inverse approach
+            J_dagger = np.linalg.pinv(J)
+            J_null = np.eye(6) - J_dagger @ J  # null space of Jacobian
+            
+            # Compute null objective gradient using numerical differentiation
+            phi = np.zeros(6)
+            
+            for i in range(6):
+                q_perturb = q.copy()
+                q_perturb[i] += epsilon
+                # Apply joint limits to perturbed configuration
+                q_perturb = np.clip(q_perturb, [limit[0] for limit in self.joint_limits], [limit[1] for limit in self.joint_limits])
+                
+                perturb_T = self._get_current_ee_se3(joint_pos=q_perturb)
+                perturb_SO3 = perturb_T[:3, :3]
+                null_obj_val_perturb = null_obj.evaluate(perturb_SO3)
+                phi[i] = (null_obj_val_perturb - null_obj_val) / epsilon
+            
+            # Update using pseudo-inverse + null-space approach
+            # delta_x = ee_pos - x (position error)
+            delta_x = pos_error
+            delta_q = J_dagger @ delta_x - J_null @ phi
+            q = q + delta_q
+            
+            # Apply joint limits
+            q = np.clip(q, [limit[0] for limit in self.joint_limits], [limit[1] for limit in self.joint_limits])
+        
+        # Final error check (position error only, like in original code)
+        current_T = self._get_current_ee_se3(joint_pos=q)
+        final_error = err  # np.linalg.norm(final_pos_error)
+        
+        # Check if both conditions are satisfied for success
+        success = (final_error < tolerance and null_obj_val < tolerance_null)
+        
+        return success, q, iter_taken, final_error, null_obj_val
 
     def _get_current_ee_orientation(self) -> np.ndarray:
         """Get current end-effector orientation as quaternion in [x,y,z,w] format."""
@@ -930,5 +886,88 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         angular_velocity = r_error.as_rotvec()
         
         return angular_velocity
-
+    
+    def _calculate_joint_directions(self, target_position, target_orientation, target_gripper, 
+                                  current_pos, current_quat, current_gripper_pos, 
+                                  control_time):
+        """
+        Calculate joint directions based on target and current poses.
+        Uses inverse kinematics to convert target pose to joint commands.
+        
+        Args:
+            target_position: Target end-effector position
+            target_orientation: Target end-effector orientation (quaternion in [x,y,z,w] format)
+            target_gripper: Target gripper position
+            current_pos: Current end-effector position
+            current_quat: Current end-effector orientation (quaternion in [x,y,z,w] format)
+            current_gripper_pos: Current gripper position
+            control_time: Time available for control
+            
+        Returns:
+            joint_directions: [J1, J2, J3, J4, J5, J6, gripper] directions
+            actual_joint_speed: Actual joint speed used
+            gripper_speed: Actual gripper speed used
+        """
+        # Convert target pose to transformation matrix
+        target_T = self._pose_to_transformation_matrix(target_position, target_orientation)
+        
+        # Get current joint positions
+        current_joint_pos = self.current_joint_pos
+        
+        # Use inverse kinematics to get target joint positions
+        # Try to solve IK for target pose using solve_ik_null_space
+        
+        success, target_joint_pos, iterations, final_error, null_obj_val = self.solve_ik_null_space(
+            target_T, 
+            initial_guess=current_joint_pos,
+            max_iterations=20,
+            tolerance=1e-2,
+            tolerance_null=1e-3
+        )
+        if not success:
+            print(f"Warning: IK failed to converge (error: {final_error:.6f}, null_obj: {null_obj_val:.6f}), using current joint positions")
+            target_joint_pos = current_joint_pos.copy()
+        else:
+            print(f"IK solved successfully in {iterations} iterations (error: {final_error:.6f}, null_obj: {null_obj_val:.6f})")
+    
+        
+        # Calculate joint position error
+        joint_error = target_joint_pos - current_joint_pos
+        joint_error_norm = np.linalg.norm(joint_error)
+        
+        # Calculate required joint speed to reach target in control_time
+        if joint_error_norm > 1e-6:
+            required_joint_speed = joint_error_norm / control_time
+            actual_joint_speed = min(required_joint_speed, self.joint_speed)
+            joint_direction = joint_error / joint_error_norm
+        else:
+            actual_joint_speed = 0.0
+            joint_direction = np.zeros(6)
+        
+        # Calculate gripper direction and speed
+        gripper_error = target_gripper - current_gripper_pos if self.has_gripper else 0.0
+        if abs(gripper_error) > 1e-6:
+            gripper_direction = np.sign(gripper_error)
+            gripper_speed = min(abs(gripper_error) / control_time, 1.0)  # Max gripper speed is 1.0
+        else:
+            gripper_direction = 0.0
+            gripper_speed = 0.0
+        
+        # Create joint command: [J1, J2, J3, J4, J5, J6, gripper] directions
+        # Scale directions by actual speeds
+        joint_directions = np.array([
+            joint_direction[0] * (actual_joint_speed / self.joint_speed) if self.joint_speed > 0 else 0,  # J1
+            joint_direction[1] * (actual_joint_speed / self.joint_speed) if self.joint_speed > 0 else 0,  # J2
+            joint_direction[2] * (actual_joint_speed / self.joint_speed) if self.joint_speed > 0 else 0,  # J3
+            joint_direction[3] * (actual_joint_speed / self.joint_speed) if self.joint_speed > 0 else 0,  # J4
+            joint_direction[4] * (actual_joint_speed / self.joint_speed) if self.joint_speed > 0 else 0,  # J5
+            joint_direction[5] * (actual_joint_speed / self.joint_speed) if self.joint_speed > 0 else 0,  # J6
+            gripper_direction * gripper_speed  # gripper
+        ])
+        
+        # Clamp directions to [-1, 1] range
+        joint_directions = np.clip(joint_directions, -1.0, 1.0)
+        
+        return joint_directions, actual_joint_speed, gripper_speed
+    
     

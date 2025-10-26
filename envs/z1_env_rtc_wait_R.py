@@ -112,7 +112,7 @@ class Z1BaseEnv(gym.Env):
             time.sleep(0.1)  # Small delay for initialization
             
             # dscho added
-            self.arm.labelRun("forward")
+            # self.arm.labelRun("forward")
             
             # Skip backToStart for now to avoid hanging
             print("Skipping backToStart() to avoid potential hanging...")
@@ -428,6 +428,7 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
             joint_angle: Optional joint angles to move to. If None, uses default reset behavior.
                         Should be a 6-element array for 6-DOF arm.
         """
+        assert joint_angle is not None, "joint_angle must be provided for stable initialization"
         super().reset(joint_angle, option=option)
         
         # Start cartesian control mode
@@ -540,7 +541,7 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         # Get current state
         self._update_state()
         current_ee_pose = self._get_current_ee_pose()
-        current_ee_pose_before_cartesianctrlcmd = current_ee_pose.copy()
+        current_ee_pose_before_cmd = current_ee_pose.copy()
         current_pos = current_ee_pose[:3]
         current_quat = current_ee_pose[3:7]
         current_gripper_pos = current_ee_pose[7] if self.has_gripper else 0.0
@@ -593,7 +594,7 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
             'actual_angular_speed': actual_angular_speed,
             'gripper_speed': gripper_speed,
             'dt_ratio': dt_ratio,
-            'current_ee_pose_before_cartesianctrlcmd': current_ee_pose_before_cartesianctrlcmd.copy(),
+            'current_ee_pose_before_cmd': current_ee_pose_before_cmd.copy(),
         }
         
         self.episode_step += 1

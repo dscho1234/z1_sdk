@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
 Example usage of the Z1 Gym environment with end-effector pose control using joint commands with IK
-and non-blocking step execution using multiprocessing PipeEnv.
+and non-blocking step execution with interrupt capability using multiprocessing PipeEnv.
 
-This example demonstrates how to use the EEPoseCtrlJointCmdWrapper with the new
-wait argument to control the Z1 robot arm's end-effector pose using joint-level commands with IK.
+This example demonstrates how to use the EEPoseCtrlJointCmdWrapper with interrupt functionality
+to control the Z1 robot arm's end-effector pose using joint-level commands with IK.
+The environment supports:
+- Precise timing control based on control frequency
+- Interrupt capability for new step requests
+- Non-blocking step execution with timeout control
 The environment is wrapped in a PipeEnv for multiprocessing communication.
 """
 
@@ -21,7 +25,7 @@ import pickle
 
 # Add the envs directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "envs"))
-from envs.z1_env_low_cmd_wait_R import EEPoseCtrlJointCmdWrapper
+from envs.z1_env_low_cmd_wait_R_interrupt import EEPoseCtrlJointCmdWrapper
 
 
 class CloudpickleWrapper(object):
@@ -505,9 +509,8 @@ def main():
         # Reset the environment
         print("Resetting environment...")
         # joint_angle = np.array([1.0, 1.5, -1.0, -0.54, 0.0, 0.0])
-        # joint_angle = np.array([-0.8, 2.572, -1.533, -0.609, 1.493, 1.004])
-        joint_angle = np.array([0.0, 1.5, -1.0, -0.54, 0.0, 0.0]) #forward
-        # joint_angle = None
+        joint_angle = np.array([-0.8, 2.572, -1.533, -0.609, 1.493, 1.004])
+        joint_angle = None
         obs = env.reset(joint_angle)
         print(f"Initial observation shape: {obs.shape}")
         print(f"Initial joint positions: {obs[:6]}")
@@ -578,6 +581,10 @@ def main():
         print(f"Inference time: {inference_time}s")
         print(f"Step interval: {step_interval:.3f}s")
         print("Note: Get observation → Execute step immediately → Run inference while robot moves")
+        print("New features:")
+        print("- Precise timing control: Steps complete exactly at control frequency intervals")
+        print("- Interrupt capability: New step requests interrupt previous steps")
+        print("- Timeout control: Steps timeout if they exceed the control frequency interval")
         print()
         
         # Track errors for average calculation
@@ -642,29 +649,30 @@ def main():
                     print(f"Step {step}: Updated action sequence for next steps")
             
             
-            print(f"Step {step}: Waiting for o_{step+1}...")
+            # Wait for step completion with precise timing control
+            print(f"Step {step}: Waiting for o_{step+1} with timeout control...")
             start = time.time()
-            while not env.env_method('is_step_complete'):
-                time.sleep(0.001)  # Small sleep to avoid busy waiting
-            print(f"Step {step}: Waited for {time.time() - start:.6f}s for o_{step+1}")
-
-            # Get the result from background execution
-            start = time.time()
-            result = env.env_method('get_step_result')
-            if result:
-                obs, reward, done, info = result # o_t+1, r_t, etc
-                print(f"Step {step}: Received o_{step+1}, time taken: {time.time() - start:.6f}s")
-            else:
-                print(f"Step {step}: Warning - No result from background step")
-                # Use previous observation if no result
-                pass
+            
+            # Use the new wait_for_step_with_timeout method for precise timing
+            result = env.env_method('wait_for_step_with_timeout', step_interval)
+            wait_time = time.time() - start
+            
+            # wait_for_step_with_timeout always returns a result (either completed or timeout)
+            obs, reward, done, info = result # o_t+1, r_t, etc
+            print(f"Step {step}: Received o_{step+1}, wait time: {wait_time:.6f}s")
+            
+            # Check if step was interrupted or timed out
+            if info.get('interrupted', False):
+                print(f"Step {step}: Previous step was interrupted")
+            if info.get('timeout', False):
+                print(f"Step {step}: Step timed out after {step_interval:.3f}s")
             
 
             # time.sleep(0.2) # intentional delay to test
 
             # Print gripper state
             gripper_state = obs[19] if len(obs) > 19 else 0.0
-            print(f"Step {step}: Gripper State = {gripper_state:.3f}")
+            # print(f"Step {step}: Gripper State = {gripper_state:.3f}")
             
             # Collect errors for average calculation
             position_errors.append(info['position_error'])

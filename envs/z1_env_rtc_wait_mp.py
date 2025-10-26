@@ -85,7 +85,7 @@ class Z1BaseEnv(gym.Env):
         self.action_space = None
         self.observation_space = None
         
-    def reset(self, joint_angle: Optional[np.ndarray] = None, option: str = "MoveJ") -> np.ndarray:
+    def reset(self, joint_angle: Optional[np.ndarray] = None, option: str = "lowcmd") -> np.ndarray:
         """
         Reset the environment to initial state.
         
@@ -110,7 +110,7 @@ class Z1BaseEnv(gym.Env):
             time.sleep(0.1)  # Small delay for initialization
             
             # dscho added
-            self.arm.labelRun("forward")
+            # self.arm.labelRun("forward")
             
             # Skip backToStart for now to avoid hanging
             print("Skipping backToStart() to avoid potential hanging...")
@@ -153,7 +153,7 @@ class Z1BaseEnv(gym.Env):
             self.current_gripper_pos = self.arm.lowstate.getGripperQ()
             self.current_gripper_vel = self.arm.gripperQd
     
-    def _move_to_joint_angles(self, target_joint_angles: np.ndarray, option: str = "MoveJ"):
+    def _move_to_joint_angles(self, target_joint_angles: np.ndarray, option: str = "lowcmd"):
         """
         Move the robot to specified joint angles using either low-level commands or MoveJ.
         
@@ -410,7 +410,7 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         
         self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
         
-    def reset(self, joint_angle: Optional[np.ndarray] = None) -> np.ndarray:
+    def reset(self, joint_angle: Optional[np.ndarray] = None, option: str = "lowcmd") -> np.ndarray:
         """
         Reset the environment and return initial observation.
         
@@ -418,7 +418,8 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
             joint_angle: Optional joint angles to move to. If None, uses default reset behavior.
                         Should be a 6-element array for 6-DOF arm.
         """
-        super().reset(joint_angle)
+        assert joint_angle is not None, "joint_angle must be provided for stable initialization"
+        super().reset(joint_angle, option=option)
         
         # Start cartesian control mode
         self.arm.startTrack(unitree_arm_interface.ArmFSMState.CARTESIAN)
@@ -666,7 +667,7 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         return self.episode_step >= self.max_episode_steps
     
     def _get_current_ee_pose(self) -> np.ndarray:
-        """Get current end-effector pose (position + quaternion)."""
+        """Get current end-effector pose (position + quaternion in [x,y,z,w] format)."""
         # Get current transformation matrix
         T = self.arm_model.forwardKinematics(self.current_joint_pos, 6)
         
@@ -674,7 +675,7 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         position = T[:3, 3]
         
         # Extract quaternion from rotation matrix
-        quaternion = R.from_matrix(T[:3, :3]).as_quat()
+        quaternion = self._rotation_matrix_to_quaternion(T[:3, :3])
         
         # Get gripper position
         gripper_pos = self.current_gripper_pos if self.has_gripper else 0.0
@@ -686,60 +687,31 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
         T = self.arm_model.forwardKinematics(self.current_joint_pos, 6)
         return T[:3, 3]
     
+    def _get_current_ee_se3(self, joint_pos = None) -> np.ndarray:
+        """Get current end-effector SE(3) matrix."""
+        if joint_pos is None:
+            joint_pos = self.current_joint_pos
+        T = self.arm_model.forwardKinematics(joint_pos, 6)
+        return T
+
     def _get_current_ee_orientation(self) -> np.ndarray:
-        """Get current end-effector orientation as quaternion."""
+        """Get current end-effector orientation as quaternion in [x,y,z,w] format."""
         T = self.arm_model.forwardKinematics(self.current_joint_pos, 6)
         return self._rotation_matrix_to_quaternion(T[:3, :3])
     
     def _quaternion_to_rotation_matrix(self, q: np.ndarray) -> np.ndarray:
-        """Convert quaternion to 3x3 rotation matrix."""
-        # Normalize quaternion
-        q = self._normalize_quaternion(q)
-        w, x, y, z = q[0], q[1], q[2], q[3]
-        
-        # Convert to rotation matrix
-        R_matrix = np.array([
-            [1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
-            [2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)],
-            [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
-        ])
-        
-        return R_matrix
+        """Convert quaternion to 3x3 rotation matrix using scipy."""
+        # q is already in [x,y,z,w] format, use directly
+        rotation = R.from_quat(q)
+        return rotation.as_matrix()
     
     def _rotation_matrix_to_quaternion(self, R_matrix: np.ndarray) -> np.ndarray:
-        """Convert 3x3 rotation matrix to quaternion."""
-        # Shepperd's method for numerical stability
-        trace = np.trace(R_matrix)
-        
-        if trace > 0:
-            s = np.sqrt(trace + 1.0) * 2  # s = 4 * qw
-            qw = 0.25 * s
-            qx = (R_matrix[2, 1] - R_matrix[1, 2]) / s
-            qy = (R_matrix[0, 2] - R_matrix[2, 0]) / s
-            qz = (R_matrix[1, 0] - R_matrix[0, 1]) / s
-        elif R_matrix[0, 0] > R_matrix[1, 1] and R_matrix[0, 0] > R_matrix[2, 2]:
-            s = np.sqrt(1.0 + R_matrix[0, 0] - R_matrix[1, 1] - R_matrix[2, 2]) * 2  # s = 4 * qx
-            qw = (R_matrix[2, 1] - R_matrix[1, 2]) / s
-            qx = 0.25 * s
-            qy = (R_matrix[0, 1] + R_matrix[1, 0]) / s
-            qz = (R_matrix[0, 2] + R_matrix[2, 0]) / s
-        elif R_matrix[1, 1] > R_matrix[2, 2]:
-            s = np.sqrt(1.0 + R_matrix[1, 1] - R_matrix[0, 0] - R_matrix[2, 2]) * 2  # s = 4 * qy
-            qw = (R_matrix[0, 2] - R_matrix[2, 0]) / s
-            qx = (R_matrix[0, 1] + R_matrix[1, 0]) / s
-            qy = 0.25 * s
-            qz = (R_matrix[1, 2] + R_matrix[2, 1]) / s
-        else:
-            s = np.sqrt(1.0 + R_matrix[2, 2] - R_matrix[0, 0] - R_matrix[1, 1]) * 2  # s = 4 * qz
-            qw = (R_matrix[1, 0] - R_matrix[0, 1]) / s
-            qx = (R_matrix[0, 2] + R_matrix[2, 0]) / s
-            qy = (R_matrix[1, 2] + R_matrix[2, 1]) / s
-            qz = 0.25 * s
-        
-        return np.array([qw, qx, qy, qz])
+        """Convert 3x3 rotation matrix to quaternion using scipy."""
+        rotation = R.from_matrix(R_matrix)
+        return rotation.as_quat()  # scipy returns [x,y,z,w] format
     
     def _pose_to_transformation_matrix(self, position: np.ndarray, quaternion: np.ndarray) -> np.ndarray:
-        """Convert position and quaternion to 4x4 transformation matrix."""
+        """Convert position and quaternion to 4x4 transformation matrix using scipy."""
         T = np.eye(4)
         T[:3, :3] = self._quaternion_to_rotation_matrix(quaternion)
         T[:3, 3] = position
@@ -747,49 +719,34 @@ class EEPoseCtrlCartesianCmdWrapper(Z1BaseEnv):
     
     
     def _normalize_quaternion(self, q: np.ndarray) -> np.ndarray:
-        """Normalize quaternion to unit length."""
-        norm = np.linalg.norm(q)
-        if norm < 1e-8:
-            return np.array([1, 0, 0, 0])
-        return q / norm
+        """Normalize quaternion to unit length using scipy."""
+        # q is already in [x,y,z,w] format, use directly
+        rotation = R.from_quat(q)
+        # scipy automatically normalizes quaternions
+        return rotation.as_quat()
+    
     
     def _quaternion_distance(self, q1: np.ndarray, q2: np.ndarray) -> float:
-        """Calculate distance between two quaternions."""
-        # Ensure quaternions are normalized
-        q1 = self._normalize_quaternion(q1)
-        q2 = self._normalize_quaternion(q2)
+        """Calculate distance between two quaternions using scipy."""
+        # q1 and q2 are already in [x,y,z,w] format, use directly
+        r1 = R.from_quat(q1)
+        r2 = R.from_quat(q2)
         
-        # Calculate dot product
-        dot_product = np.abs(np.dot(q1, q2))
-        
-        # Clamp to avoid numerical errors
-        dot_product = np.clip(dot_product, 0.0, 1.0)
-        
-        # Calculate angle between quaternions
-        angle = 2 * np.arccos(dot_product)
-        
-        return angle
+        # Calculate relative rotation and get magnitude
+        relative_rotation = r2 * r1.inv()
+        return np.linalg.norm(relative_rotation.as_rotvec())
     
     def _quaternion_error(self, q_target: np.ndarray, q_current: np.ndarray) -> np.ndarray:
-        """Calculate angular velocity error between target and current quaternions."""
-        # Ensure quaternions are normalized
-        q_target = self._normalize_quaternion(q_target)
-        q_current = self._normalize_quaternion(q_current)
+        """Calculate angular velocity error between target and current quaternions using scipy."""
+        # q_target and q_current are already in [x,y,z,w] format, use directly
+        r_target = R.from_quat(q_target)
+        r_current = R.from_quat(q_current)
         
-        # Calculate quaternion error: q_error = q_target * q_current^-1
-        q_current_inv = np.array([q_current[0], -q_current[1], -q_current[2], -q_current[3]])
+        # Calculate relative rotation: r_error = r_target * r_current^-1
+        r_error = r_target * r_current.inv()
         
-        # Quaternion multiplication
-        w = q_target[0] * q_current_inv[0] - q_target[1] * q_current_inv[1] - q_target[2] * q_current_inv[2] - q_target[3] * q_current_inv[3]
-        x = q_target[0] * q_current_inv[1] + q_target[1] * q_current_inv[0] + q_target[2] * q_current_inv[3] - q_target[3] * q_current_inv[2]
-        y = q_target[0] * q_current_inv[2] - q_target[1] * q_current_inv[3] + q_target[2] * q_current_inv[0] + q_target[3] * q_current_inv[1]
-        z = q_target[0] * q_current_inv[3] + q_target[1] * q_current_inv[2] - q_target[2] * q_current_inv[1] + q_target[3] * q_current_inv[0]
-        
-        q_error = np.array([w, x, y, z])
-        
-        # Convert quaternion error to angular velocity (simplified)
-        # For small errors, angular velocity is approximately 2 * [x, y, z]
-        angular_velocity = 2.0 * q_error[1:4]  # [wx, wy, wz]
+        # Convert to rotation vector (angular velocity)
+        angular_velocity = r_error.as_rotvec()
         
         return angular_velocity
     

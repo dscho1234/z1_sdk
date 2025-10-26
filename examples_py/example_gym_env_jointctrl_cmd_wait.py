@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Example usage of the Z1 Gym environment with end-effector pose control using cartesian commands
+Example usage of the Z1 Gym environment with end-effector pose control using joint commands
 and non-blocking step execution.
 
-This example demonstrates how to use the EEPoseCtrlCartesianCmdWrapper with the new
-wait argument to control the Z1 robot arm's end-effector pose using non-blocking step execution.
+This example demonstrates how to use the EEPoseCtrlJointCmdWrapper with the new
+wait argument to control the Z1 robot arm's end-effector pose using jointCtrlCmd.
 """
 
 import sys
@@ -17,7 +17,7 @@ from scipy.spatial.transform import Rotation as R
 
 # Add the envs directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "envs"))
-from envs.z1_env_rtc_wait_mp import EEPoseCtrlCartesianCmdWrapper
+from envs.z1_env_jointctrl_wait_R import EEPoseCtrlJointCmdWrapper
 
 
 class DummyMLP(nn.Module):
@@ -44,7 +44,7 @@ class DummyMLP(nn.Module):
         return self.network(x)
 
 
-def inference_function(observation, square_vertices, orientation_vertices, total_steps, current_step, dummy_mlp, sequence_length=16, inference_time=0.15):
+def inference_function(observation, square_vertices, orientation_vertices, total_steps, current_step, dummy_mlp, sequence_length=16, inference_time=0.15, env=None):
     """
     Simulate inference function that takes observation and returns action sequence.
     This uses the same square sequence generation as the original example.
@@ -71,12 +71,17 @@ def inference_function(observation, square_vertices, orientation_vertices, total
         dummy_output = dummy_mlp(obs_tensor)
         print(f"Dummy MLP inference completed: device: {dummy_output.device}, input shape {obs_tensor.shape}, output shape {dummy_output.shape}")
     
+    start = time.time()
+    for _ in range(10):
+        env._get_current_ee_pose()
+    print(f"In inference function, get_current_ee_pose time: {time.time() - start:.6f}s")
+
     # Simulate inference time
     time.sleep(inference_time)
     
     # Extract current position and orientation from observation
     current_pos = observation[12:15]  # End-effector position
-    current_orient = observation[15:19]  # End-effector orientation (quaternion)
+    current_orient = observation[15:19]  # End-effector orientation (quaternion in [x,y,z,w] format)
     current_gripper = observation[19]  # Gripper position
     
     # Use the same square sequence generation as the original example
@@ -140,6 +145,7 @@ def generate_action_sequence(base_position, base_orientation, base_gripper, squa
         end_orientation = orientation_vertices[edge_index + 1]
         
         # Use SLERP (Spherical Linear Interpolation) for proper quaternion interpolation
+        # start_orientation and end_orientation are in [x,y,z,w] format
         start_rot = R.from_quat(start_orientation)
         end_rot = R.from_quat(end_orientation)
         
@@ -147,17 +153,18 @@ def generate_action_sequence(base_position, base_orientation, base_gripper, squa
         # This uses scipy's built-in SLERP functionality
         new_rot = start_rot * (start_rot.inv() * end_rot) ** t
         
-        # Convert back to quaternion
+        # Convert back to quaternion (returns [x,y,z,w] format)
         new_orientation = new_rot.as_quat().squeeze()
         
         # Gripper: alternate between open and close for each edge
         # Edge 0: open (1), Edge 1: close (-1), Edge 2: open (1), Edge 3: close (-1)
         if edge_index % 2 == 0:
-            new_gripper = 1.0  # Open
+            new_gripper = -1.0  # Open
         else:
-            new_gripper = -1.0  # Close
+            new_gripper = 0.0  # Close
         
-        # Combine into action
+        # Combine into action: [x, y, z, qx, qy, qz, qw, gripper]
+        # new_orientation is in [x,y,z,w] format, which matches the expected action format
         sequence[i] = np.concatenate([target_position, new_orientation, [new_gripper]])
     
     return sequence
@@ -176,18 +183,17 @@ def main():
     dummy_mlp.eval()  # Set to evaluation mode
     print(f"Created dummy MLP model: {dummy_mlp}")
     
-    # Create the environment with 5Hz control frequency
+    # Create the environment with 2Hz control frequency
     control_frequency = 2 # 5
     sequence_length = 16   # Length of future target pose sequences
     step_interval = 1.0 / control_frequency  # Time between steps in seconds
     
-    env = EEPoseCtrlCartesianCmdWrapper(
+    env = EEPoseCtrlJointCmdWrapper(
         has_gripper=True,
-        control_frequency=control_frequency,  # 5Hz control frequency
+        control_frequency=control_frequency,  # 2Hz control frequency
         position_tolerance=0.01,
         orientation_tolerance=0.1,
-        angular_vel=1.0,  # Angular velocity limit
-        linear_vel=0.3,   # Linear velocity limit
+        joint_speed=1.0,  # Joint speed limit
         sequence_length=sequence_length,  # Length of future sequences
         
     )
@@ -203,11 +209,11 @@ def main():
         # joint_angle = np.array([-0.8, 2.572, -1.533, -0.609, 1.493, 1.004])
         joint_angle = np.array([0.0, 1.5, -1.0, -0.54, 0.0, 0.0]) #forward
         # joint_angle = None
-        obs = env.reset(joint_angle)
+        obs = env.reset(joint_angle) # , option="lowcmd"
         print(f"Initial observation shape: {obs.shape}")
         print(f"Initial joint positions: {obs[:6]}")
         print(f"Initial end-effector position: {obs[12:15]}")
-        print(f"Initial end-effector orientation: {obs[15:19]}")
+        print(f"Initial end-effector orientation (quaternion [x,y,z,w]): {obs[15:19]}")
         print(f"Initial gripper position: {obs[19]}")
         print()
     
@@ -219,22 +225,22 @@ def main():
         print("Orientation will change roll: 0°, +90°, 0°, -90°, 0° for each edge")
         print(f"Control frequency: {control_frequency} Hz")
         print(f"Step interval: {step_interval:.3f}s")
-        print(f"Angular velocity limit: {env.angular_vel} rad/s")
-        print(f"Linear velocity limit: {env.linear_vel} m/s")
+        print(f"Joint speed limit: {env.joint_speed} rad/s")
         print(f"Sequence length: {sequence_length}")
         print()
         
         # Get current end-effector position and orientation from observation
         original_position = obs[12:15].copy()  # Store original position
-        current_orientation = obs[15:19]  # Current end-effector orientation (quaternion)
+        current_orientation = obs[15:19]  # Current end-effector orientation (quaternion in [x,y,z,w] format)
         target_gripper = 0 
         
         print(f"Original EE position: {original_position}")
-        print(f"Current EE orientation: {current_orientation}")
+        print(f"Current EE orientation (quaternion [x,y,z,w]): {current_orientation}")
         print()
         
         # dscho debug to specify the position and orientation
         original_position = np.array([0.41145274, -0.00121779, 0.40713578])
+        # Convert from [w,x,y,z] to [x,y,z,w] format for scipy compatibility
         current_orientation_wxyz = np.array([0.9998209, -0.0011671, -0.01868073, -0.00280654])  # [w,x,y,z]
         current_orientation = np.array([current_orientation_wxyz[1], current_orientation_wxyz[2], 
                                        current_orientation_wxyz[3], current_orientation_wxyz[0]])  # [x,y,z,w]
@@ -248,7 +254,7 @@ def main():
         #     original_position + np.array([0.0, 0.0, square_size]),   # Z+0.1
         #     original_position + np.array([0.0, 0.0, 0.0])            # Back to start
         # ]
-        
+
         square_vertices = [
             original_position + np.array([0.0, 0.0, 0.0]),           # Start point
             original_position + np.array([0.0, 0.0, -square_size]),   # Z-0.1
@@ -257,17 +263,17 @@ def main():
             original_position + np.array([0.0, 0.0, 0.0])            # Back to start
         ]
 
-
+        
         # Define orientation vertices with roll changes: 0°, +90°, 0°, -90°, 0°
         roll_angles = [0, np.pi/4, 0, -np.pi/4, 0]  # 0°, +90°, 0°, -90°, 0°
         orientation_vertices = []
         
         for roll_angle in roll_angles:
-            # Convert base orientation (quaternion) to rotation matrix, apply roll, convert back
-            base_rot = R.from_quat(current_orientation)
+            # Convert base orientation (quaternion in [x,y,z,w] format) to rotation matrix, apply roll, convert back
+            base_rot = R.from_quat(current_orientation)  # current_orientation is in [x,y,z,w] format
             roll_rot = R.from_euler('x', roll_angle)
             new_rot = base_rot * roll_rot
-            orientation_vertices.append(new_rot.as_quat())
+            orientation_vertices.append(new_rot.as_quat())  # Returns [x,y,z,w] format
         
         print("Square movement plan:")
         for i, vertex in enumerate(square_vertices):
@@ -297,7 +303,7 @@ def main():
         # Generate initial action sequence from o_0 (before for loop)
         print("Generating initial action sequence from o_0...")
         current_action_sequence = inference_function(
-            obs, square_vertices, orientation_vertices, total_steps, 0, dummy_mlp, sequence_length, inference_time
+            obs, square_vertices, orientation_vertices, total_steps, 0, dummy_mlp, sequence_length, inference_time, env
         ) # o_0 -> a_0, a_1, a_2, ...
         current_action_index = 0
         
@@ -335,7 +341,7 @@ def main():
                 print(f"Step {step}: Running inference with o_{step} while robot moves...")
                 inference_start_time = time.time()
                 latest_inference_result = inference_function(
-                    obs, square_vertices, orientation_vertices, total_steps, step, dummy_mlp, sequence_length, inference_time
+                    obs, square_vertices, orientation_vertices, total_steps, step, dummy_mlp, sequence_length, inference_time, env
                 ) # o_t+1 -> a_t+1, a_t+2, a_t+3, ...
                 inference_time_actual = time.time() - inference_start_time
                 print(f"Step {step}: Inference completed in {inference_time_actual:.3f}s")
@@ -385,8 +391,8 @@ def main():
         print(f"Final position: [{final_pos[0]:.3f}, {final_pos[1]:.3f}, {final_pos[2]:.3f}]")
         print(f"Final position error: {final_error:.4f}")
         print(f"Final FSM state: {info['fsm_state']}")
-        print(f"Final cartesian directions: {info['cartesian_directions']}")
-        print(f"Final speeds - Linear: {info['actual_linear_speed']:.3f}, Angular: {info['actual_angular_speed']:.3f}, Gripper: {info['gripper_speed']:.3f}")
+        print(f"Final joint directions: {info['joint_directions']}")
+        print(f"Final speeds - Joint: {info['actual_joint_speed']:.3f}, Gripper: {info['gripper_speed']:.3f}")
         print(f"DT ratio (actual_control_time/arm_dt): {info['dt_ratio']}")
         print(f"Final sequence index: {env.sequence_index}")
         print(f"Final sequence length: {len(env.current_sequence) if env.current_sequence is not None else 0}")
