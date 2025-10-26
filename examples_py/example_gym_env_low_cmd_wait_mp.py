@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Example usage of the Z1 Gym environment with end-effector pose control using cartesian commands
-and non-blocking step execution.
+Example usage of the Z1 Gym environment with end-effector pose control using joint commands with IK
+and non-blocking step execution using multiprocessing PipeEnv.
 
-This example demonstrates how to use the EEPoseCtrlCartesianCmdWrapper with the new
-wait argument to control the Z1 robot arm's end-effector pose using non-blocking step execution.
+This example demonstrates how to use the EEPoseCtrlJointCmdWrapper with the new
+wait argument to control the Z1 robot arm's end-effector pose using joint-level commands with IK.
+The environment is wrapped in a PipeEnv for multiprocessing communication.
 """
 
 import sys
@@ -14,10 +15,278 @@ import time
 import torch
 import torch.nn as nn
 from scipy.spatial.transform import Rotation as R
+import multiprocessing
+import cloudpickle
+import pickle
 
 # Add the envs directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "envs"))
-from envs.z1_env_rtc_wait_R import EEPoseCtrlCartesianCmdWrapper
+from envs.z1_env_low_cmd_wait_R import EEPoseCtrlJointCmdWrapper
+
+
+class CloudpickleWrapper(object):
+    def __init__(self, var):
+        """
+        Uses cloudpickle to serialize contents (otherwise multiprocessing tries to use pickle)
+
+        :param var: (Any) the variable you wish to wrap for pickling with cloudpickle
+        """
+        self.var = var
+
+    def __getstate__(self):
+        return cloudpickle.dumps(self.var)
+
+    def __setstate__(self, obs):
+        self.var = pickle.loads(obs)
+
+
+def _worker(remote, parent_remote, env_fn_wrapper):
+    parent_remote.close()
+    env = env_fn_wrapper.var()
+    while True:
+        try:
+            cmd, data = remote.recv()
+            if cmd == 'step':
+                cmd_id, action, wait = data
+                observation, reward, done, info = env.step(action, wait)
+                # remote.send((cmd_id, 'step', (observation, reward, done, info)))
+            elif cmd == 'reset':
+                cmd_id, joint_angle = data
+                observation = env.reset(joint_angle)
+                remote.send((cmd_id, 'reset', observation))
+            elif cmd == 'close':
+                remote.close()
+                break
+            elif cmd == 'get_spaces':
+                remote.send((None, 'get_spaces', (env.observation_space, env.action_space)))
+            elif cmd == 'env_method':
+                cmd_id, method_name, method_args, method_kwargs = data
+                method = getattr(env, method_name)
+                result = method(*method_args, **method_kwargs)
+                remote.send((cmd_id, 'env_method', result))
+            elif cmd == 'get_attr':
+                cmd_id, attr_name = data
+                remote.send((cmd_id, 'get_attr', getattr(env, attr_name)))
+            elif cmd == 'set_attr':
+                cmd_id, attr_name, value = data
+                remote.send((cmd_id, 'set_attr', setattr(env, attr_name, value)))
+            else:
+                raise NotImplementedError
+        except EOFError:
+            break
+
+
+class PipeEnv:
+    """
+    Single environment wrapper using multiprocessing pipe for communication.
+    
+    This class solves the multiprocessing send/recv ordering problem by using
+    command IDs to match requests with their corresponding responses.
+    
+    Usage example:
+        # Start a step
+        cmd_id = env.step(action)
+        
+        # Call other methods while step is running
+        result = env.env_method('some_method', arg1, arg2)
+        
+        # Wait for the specific step to complete
+        obs, reward, done, info = env.step_wait(cmd_id)
+    """
+    
+    def __init__(self, env_fn, start_method=None):
+        self.waiting = False
+        self.closed = False
+        self.cmd_counter = 0
+        self.pending_results = {}  # cmd_id -> result
+        
+        if start_method is None:
+            # Fork is not a thread safe method (see issue #217)
+            # but is more user friendly (does not require to wrap the code in
+            # a `if __name__ == "__main__":`)
+            forkserver_available = 'forkserver' in multiprocessing.get_all_start_methods()
+            start_method = 'forkserver' if forkserver_available else 'spawn'
+        ctx = multiprocessing.get_context(start_method)
+
+        self.remote, self.work_remote = ctx.Pipe(duplex=True)
+        args = (self.work_remote, self.remote, CloudpickleWrapper(env_fn))
+        # daemon=True: if the main process crashes, we should not cause things to hang
+        self.process = ctx.Process(target=_worker, args=args, daemon=True)
+        self.process.start()
+        self.work_remote.close()
+
+        # self.remote.send(('get_spaces', None))
+        # self.observation_space, self.action_space = self.remote.recv()
+
+    def step_async(self, action, wait=False):
+        self.cmd_counter += 1
+        cmd_id = self.cmd_counter
+        self.remote.send(('step', (cmd_id, action, wait)))
+        self.waiting = True
+        return cmd_id
+
+    def step_wait(self, cmd_id=None):
+        if cmd_id is None:
+            # Legacy mode: just receive the next result
+            result = self.remote.recv()
+            self.waiting = False
+            if isinstance(result, tuple) and len(result) == 3:
+                # New format: (cmd_id, cmd_type, data)
+                cmd_id, cmd_type, data = result
+                if cmd_type == 'step':
+                    observation, reward, done, info = data
+                    return observation, reward, done, info
+            else:
+                # Old format: (observation, reward, done, info)
+                observation, reward, done, info = result
+                return observation, reward, done, info
+        else:
+            # New mode: wait for specific command ID
+            while cmd_id not in self.pending_results:
+                result = self.remote.recv()
+                if isinstance(result, tuple) and len(result) == 3:
+                    recv_cmd_id, cmd_type, data = result
+                    self.pending_results[recv_cmd_id] = (cmd_type, data)
+                else:
+                    # Handle legacy format
+                    self.pending_results[cmd_id] = ('step', result)
+                    break
+            
+            cmd_type, data = self.pending_results.pop(cmd_id)
+            self.waiting = False
+            if cmd_type == 'step':
+                observation, reward, done, info = data
+                return observation, reward, done, info
+            else:
+                raise ValueError(f"Expected step result, got {cmd_type}")
+        return observation, reward, done, info
+
+    def step(self, action, wait=False):
+        """
+        Step the environment with the given action (non-blocking)
+        This starts the step in background and returns immediately.
+        Use step_wait() to get the results.
+
+        :param action: ([int] or [float]) the action
+        :return: cmd_id (use step_wait(cmd_id) to get results)
+        """
+        return self.step_async(action, wait)
+
+    def reset(self, joint_angle=None):
+        self.cmd_counter += 1
+        cmd_id = self.cmd_counter
+        self.remote.send(('reset', (cmd_id, joint_angle)))
+        
+        # Wait for the specific result
+        while cmd_id not in self.pending_results:
+            result = self.remote.recv()
+            if isinstance(result, tuple) and len(result) == 3:
+                recv_cmd_id, cmd_type, data = result
+                self.pending_results[recv_cmd_id] = (cmd_type, data)
+            else:
+                # Handle legacy format - assume it's for this command
+                self.pending_results[cmd_id] = ('reset', result)
+                break
+        
+        cmd_type, data = self.pending_results.pop(cmd_id)
+        if cmd_type == 'reset':
+            return data
+        else:
+            raise ValueError(f"Expected reset result, got {cmd_type}")
+
+    def close(self):
+        if self.closed:
+            return
+        try:
+            if self.waiting:
+                self.remote.recv()
+            self.remote.send(('close', None))
+        except (EOFError, BrokenPipeError, ConnectionResetError):
+            # Worker process already terminated, skip communication
+            pass
+        except Exception as e:
+            print(f"Warning: Error during close communication: {e}")
+        
+        try:
+            self.process.join(timeout=5.0)  # Add timeout to prevent hanging
+        except Exception as e:
+            print(f"Warning: Error joining process: {e}")
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(timeout=2.0)
+                if self.process.is_alive():
+                    self.process.kill()
+        
+        self.closed = True
+    
+    def env_method(self, method_name, *method_args, **method_kwargs):
+        """Call instance methods of environment."""
+        self.cmd_counter += 1
+        cmd_id = self.cmd_counter
+        self.remote.send(('env_method', (cmd_id, method_name, method_args, method_kwargs)))
+        
+        # Wait for the specific result
+        while cmd_id not in self.pending_results:
+            result = self.remote.recv()
+            if isinstance(result, tuple) and len(result) == 3:
+                recv_cmd_id, cmd_type, data = result
+                self.pending_results[recv_cmd_id] = (cmd_type, data)
+            else:
+                # Handle legacy format - assume it's for this command
+                self.pending_results[cmd_id] = ('env_method', result)
+                break
+        
+        cmd_type, data = self.pending_results.pop(cmd_id)
+        if cmd_type == 'env_method':
+            return data
+        else:
+            raise ValueError(f"Expected env_method result, got {cmd_type}")
+
+    def get_attr(self, attr_name):
+        """Return attribute from environment."""
+        self.cmd_counter += 1
+        cmd_id = self.cmd_counter
+        self.remote.send(('get_attr', (cmd_id, attr_name)))
+        
+        # Wait for the specific result
+        while cmd_id not in self.pending_results:
+            result = self.remote.recv()
+            if isinstance(result, tuple) and len(result) == 3:
+                recv_cmd_id, cmd_type, data = result
+                self.pending_results[recv_cmd_id] = (cmd_type, data)
+            else:
+                # Handle legacy format - assume it's for this command
+                self.pending_results[cmd_id] = ('get_attr', result)
+                break
+        
+        cmd_type, data = self.pending_results.pop(cmd_id)
+        if cmd_type == 'get_attr':
+            return data
+        else:
+            raise ValueError(f"Expected get_attr result, got {cmd_type}")
+
+    def set_attr(self, attr_name, value):
+        """Set attribute inside environment."""
+        self.cmd_counter += 1
+        cmd_id = self.cmd_counter
+        self.remote.send(('set_attr', (cmd_id, attr_name, value)))
+        
+        # Wait for the specific result
+        while cmd_id not in self.pending_results:
+            result = self.remote.recv()
+            if isinstance(result, tuple) and len(result) == 3:
+                recv_cmd_id, cmd_type, data = result
+                self.pending_results[recv_cmd_id] = (cmd_type, data)
+            else:
+                # Handle legacy format - assume it's for this command
+                self.pending_results[cmd_id] = ('set_attr', result)
+                break
+        
+        cmd_type, data = self.pending_results.pop(cmd_id)
+        if cmd_type == 'set_attr':
+            return data
+        else:
+            raise ValueError(f"Expected set_attr result, got {cmd_type}")
 
 
 class DummyMLP(nn.Module):
@@ -44,6 +313,30 @@ class DummyMLP(nn.Module):
         return self.network(x)
 
 
+def make_robot_env(control_frequency=2, sequence_length=16, position_tolerance=0.01, 
+                   orientation_tolerance=0.1, has_gripper=True):
+    """
+    Utility function for multiprocessed robot env.
+
+    :param control_frequency: (int) control frequency in Hz
+    :param sequence_length: (int) length of future target pose sequences
+    :param position_tolerance: (float) position tolerance
+    :param orientation_tolerance: (float) orientation tolerance
+    :param has_gripper: (bool) whether to include gripper
+    """
+    def _init():
+        env = EEPoseCtrlJointCmdWrapper(
+            has_gripper=has_gripper,
+            control_frequency=control_frequency,
+            position_tolerance=position_tolerance,
+            orientation_tolerance=orientation_tolerance,
+            sequence_length=sequence_length,
+        )
+        return env
+    
+    return _init
+
+
 def inference_function(observation, square_vertices, orientation_vertices, total_steps, current_step, dummy_mlp, sequence_length=16, inference_time=0.15, env=None):
     """
     Simulate inference function that takes observation and returns action sequence.
@@ -58,6 +351,7 @@ def inference_function(observation, square_vertices, orientation_vertices, total
         dummy_mlp: Dummy MLP model for thread-torch compatibility testing
         sequence_length: Length of target pose sequence to generate
         inference_time: Time to simulate inference (seconds)
+        env: PipeEnv instance for calling environment methods
         
     Returns:
         action_sequence: Generated action sequence [sequence_length, 8]
@@ -71,10 +365,12 @@ def inference_function(observation, square_vertices, orientation_vertices, total
         dummy_output = dummy_mlp(obs_tensor)
         print(f"Dummy MLP inference completed: device: {dummy_output.device}, input shape {obs_tensor.shape}, output shape {dummy_output.shape}")
     
-    start = time.time()
-    for _ in range(10):
-        env._get_current_ee_pose()
-    print(f"In inference function, get_current_ee_pose time: {time.time() - start:.6f}s")
+    # Test environment method calls through PipeEnv
+    if env is not None:
+        start = time.time()
+        for _ in range(10):
+            env.env_method('_get_current_ee_pose')
+        print(f"In inference function, get_current_ee_pose time: {time.time() - start:.6f}s")
 
     # Simulate inference time
     time.sleep(inference_time)
@@ -174,7 +470,7 @@ def generate_action_sequence(base_position, base_orientation, base_gripper, squa
 
 def main():
     """Main example function."""
-    print("Z1 Gym Environment Example - Non-blocking Step Execution")
+    print("Z1 Gym Environment Example - Non-blocking Step Execution with PipeEnv")
     print("=" * 80)
     
     # Create dummy MLP model for thread-torch compatibility testing
@@ -183,24 +479,26 @@ def main():
     dummy_mlp.eval()  # Set to evaluation mode
     print(f"Created dummy MLP model: {dummy_mlp}")
     
-    # Create the environment with 5Hz control frequency
-    control_frequency = 2 # 5
+    # Create the environment with 2Hz control frequency using PipeEnv
+    control_frequency = 2 # 2Hz control frequency
     sequence_length = 16   # Length of future target pose sequences
     step_interval = 1.0 / control_frequency  # Time between steps in seconds
     
-    env = EEPoseCtrlCartesianCmdWrapper(
-        has_gripper=True,
-        control_frequency=control_frequency,  # 5Hz control frequency
+    # Create environment function
+    robot_env_fn = make_robot_env(
+        control_frequency=control_frequency,
+        sequence_length=sequence_length,
         position_tolerance=0.01,
         orientation_tolerance=0.1,
-        angular_vel=1.0,  # Angular velocity limit
-        linear_vel=0.3,   # Linear velocity limit
-        sequence_length=sequence_length,  # Length of future sequences
-        
+        has_gripper=True
     )
     
-    print(f"Action space: {env.action_space}")
-    print(f"Observation space: {env.observation_space}")
+    # Create multiprocess environment
+    env = PipeEnv(robot_env_fn)
+    
+    print(f"Control frequency: {control_frequency} Hz")
+    print(f"Sequence length: {sequence_length}")
+    print(f"Step interval: {step_interval:.3f}s")
     print()
     
     try:
@@ -208,8 +506,8 @@ def main():
         print("Resetting environment...")
         # joint_angle = np.array([1.0, 1.5, -1.0, -0.54, 0.0, 0.0])
         joint_angle = np.array([-0.8, 2.572, -1.533, -0.609, 1.493, 1.004])
-        # joint_angle = None
-        obs = env.reset(joint_angle) # , option="lowcmd"
+        joint_angle = None
+        obs = env.reset(joint_angle)
         print(f"Initial observation shape: {obs.shape}")
         print(f"Initial joint positions: {obs[:6]}")
         print(f"Initial end-effector position: {obs[12:15]}")
@@ -225,8 +523,6 @@ def main():
         print("Orientation will change roll: 0°, +90°, 0°, -90°, 0° for each edge")
         print(f"Control frequency: {control_frequency} Hz")
         print(f"Step interval: {step_interval:.3f}s")
-        print(f"Angular velocity limit: {env.angular_vel} rad/s")
-        print(f"Linear velocity limit: {env.linear_vel} m/s")
         print(f"Sequence length: {sequence_length}")
         print()
         
@@ -295,7 +591,7 @@ def main():
         # Generate initial action sequence from o_0 (before for loop)
         print("Generating initial action sequence from o_0...")
         current_action_sequence = inference_function(
-            obs, square_vertices, orientation_vertices, total_steps, 0, dummy_mlp, sequence_length, inference_time, env
+            obs, square_vertices, orientation_vertices, total_steps, 0, dummy_mlp, sequence_length, 0.01, env
         ) # o_0 -> a_0, a_1, a_2, ...
         current_action_index = 0
         
@@ -347,13 +643,13 @@ def main():
             
             print(f"Step {step}: Waiting for o_{step+1}...")
             start = time.time()
-            while not env.is_step_complete():
+            while not env.env_method('is_step_complete'):
                 time.sleep(0.001)  # Small sleep to avoid busy waiting
             print(f"Step {step}: Waited for {time.time() - start:.6f}s for o_{step+1}")
 
             # Get the result from background execution
             start = time.time()
-            result = env.get_step_result()
+            result = env.env_method('get_step_result')
             if result:
                 obs, reward, done, info = result # o_t+1, r_t, etc
                 print(f"Step {step}: Received o_{step+1}, time taken: {time.time() - start:.6f}s")
@@ -383,11 +679,14 @@ def main():
         print(f"Final position: [{final_pos[0]:.3f}, {final_pos[1]:.3f}, {final_pos[2]:.3f}]")
         print(f"Final position error: {final_error:.4f}")
         print(f"Final FSM state: {info['fsm_state']}")
-        print(f"Final cartesian directions: {info['cartesian_directions']}")
-        print(f"Final speeds - Linear: {info['actual_linear_speed']:.3f}, Angular: {info['actual_angular_speed']:.3f}, Gripper: {info['gripper_speed']:.3f}")
-        print(f"DT ratio (actual_control_time/arm_dt): {info['dt_ratio']}")
-        print(f"Final sequence index: {env.sequence_index}")
-        print(f"Final sequence length: {len(env.current_sequence) if env.current_sequence is not None else 0}")
+        print(f"Final target joint angles: {info['target_joint_angles']}")
+        print(f"Final current joint angles: {info['current_joint_angles']}")
+        print(f"IK success: {info['ik_success']}, iterations: {info['ik_iterations']}, error: {info['ik_error']:.6f}")
+        print(f"dt_ratio: {info['dt_ratio']} control steps")
+        print(f"cmd_time: {info['cmd_time']:.6f}s")
+        # print(f"Final sequence index: {env.env_method('sequence_index')}")
+        # current_sequence = env.env_method('current_sequence')
+        # print(f"Final sequence length: {len(current_sequence) if current_sequence is not None else 0}")
         
         # Calculate and print average errors
         if position_errors:
@@ -399,7 +698,7 @@ def main():
             print(f"  Total steps executed: {len(position_errors)}")
         
         print()
-        print("\nNon-blocking square movement with sequence handling completed successfully!")
+        print("\nNon-blocking square movement with joint commands and IK completed successfully!")
         
     except KeyboardInterrupt:
         print("\nInterrupted by user")
@@ -415,5 +714,8 @@ def main():
 
 
 if __name__ == "__main__":    
+    # Set multiprocessing start method for compatibility
+    # multiprocessing.set_start_method('spawn', force=True)
+    
     # Run main example
     main()

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Example usage of the Z1 Gym environment with end-effector pose control using cartesian commands
+Example usage of the Z1 Gym environment with end-effector pose control using joint commands with IK
 and non-blocking step execution.
 
-This example demonstrates how to use the EEPoseCtrlCartesianCmdWrapper with the new
-wait argument to control the Z1 robot arm's end-effector pose using non-blocking step execution.
+This example demonstrates how to use the EEPoseCtrlJointCmdWrapper with the new
+wait argument to control the Z1 robot arm's end-effector pose using joint-level commands with IK.
 """
 
 import sys
@@ -17,7 +17,7 @@ from scipy.spatial.transform import Rotation as R
 
 # Add the envs directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "envs"))
-from envs.z1_env_rtc_wait_R import EEPoseCtrlCartesianCmdWrapper
+from envs.z1_env_low_cmd_wait_R import EEPoseCtrlJointCmdWrapper
 
 
 class DummyMLP(nn.Module):
@@ -183,18 +183,16 @@ def main():
     dummy_mlp.eval()  # Set to evaluation mode
     print(f"Created dummy MLP model: {dummy_mlp}")
     
-    # Create the environment with 5Hz control frequency
-    control_frequency = 2 # 5
+    # Create the environment with 2Hz control frequency
+    control_frequency = 2 # 2Hz control frequency
     sequence_length = 16   # Length of future target pose sequences
     step_interval = 1.0 / control_frequency  # Time between steps in seconds
     
-    env = EEPoseCtrlCartesianCmdWrapper(
+    env = EEPoseCtrlJointCmdWrapper(
         has_gripper=True,
-        control_frequency=control_frequency,  # 5Hz control frequency
+        control_frequency=control_frequency,  # 2Hz control frequency
         position_tolerance=0.01,
         orientation_tolerance=0.1,
-        angular_vel=1.0,  # Angular velocity limit
-        linear_vel=0.3,   # Linear velocity limit
         sequence_length=sequence_length,  # Length of future sequences
         
     )
@@ -208,7 +206,7 @@ def main():
         print("Resetting environment...")
         # joint_angle = np.array([1.0, 1.5, -1.0, -0.54, 0.0, 0.0])
         joint_angle = np.array([-0.8, 2.572, -1.533, -0.609, 1.493, 1.004])
-        # joint_angle = None
+        joint_angle = None
         obs = env.reset(joint_angle) # , option="lowcmd"
         print(f"Initial observation shape: {obs.shape}")
         print(f"Initial joint positions: {obs[:6]}")
@@ -225,8 +223,7 @@ def main():
         print("Orientation will change roll: 0°, +90°, 0°, -90°, 0° for each edge")
         print(f"Control frequency: {control_frequency} Hz")
         print(f"Step interval: {step_interval:.3f}s")
-        print(f"Angular velocity limit: {env.angular_vel} rad/s")
-        print(f"Linear velocity limit: {env.linear_vel} m/s")
+        print(f"dt_ratio: {int(env.dt / env.arm._ctrlComp.dt)} control steps")
         print(f"Sequence length: {sequence_length}")
         print()
         
@@ -295,7 +292,7 @@ def main():
         # Generate initial action sequence from o_0 (before for loop)
         print("Generating initial action sequence from o_0...")
         current_action_sequence = inference_function(
-            obs, square_vertices, orientation_vertices, total_steps, 0, dummy_mlp, sequence_length, inference_time, env
+            obs, square_vertices, orientation_vertices, total_steps, 0, dummy_mlp, sequence_length, 0.01, env
         ) # o_0 -> a_0, a_1, a_2, ...
         current_action_index = 0
         
@@ -383,9 +380,11 @@ def main():
         print(f"Final position: [{final_pos[0]:.3f}, {final_pos[1]:.3f}, {final_pos[2]:.3f}]")
         print(f"Final position error: {final_error:.4f}")
         print(f"Final FSM state: {info['fsm_state']}")
-        print(f"Final cartesian directions: {info['cartesian_directions']}")
-        print(f"Final speeds - Linear: {info['actual_linear_speed']:.3f}, Angular: {info['actual_angular_speed']:.3f}, Gripper: {info['gripper_speed']:.3f}")
-        print(f"DT ratio (actual_control_time/arm_dt): {info['dt_ratio']}")
+        print(f"Final target joint angles: {info['target_joint_angles']}")
+        print(f"Final current joint angles: {info['current_joint_angles']}")
+        print(f"IK success: {info['ik_success']}, iterations: {info['ik_iterations']}, error: {info['ik_error']:.6f}")
+        print(f"dt_ratio: {info['dt_ratio']} control steps")
+        print(f"cmd_time: {info['cmd_time']:.6f}s")
         print(f"Final sequence index: {env.sequence_index}")
         print(f"Final sequence length: {len(env.current_sequence) if env.current_sequence is not None else 0}")
         
@@ -399,7 +398,7 @@ def main():
             print(f"  Total steps executed: {len(position_errors)}")
         
         print()
-        print("\nNon-blocking square movement with sequence handling completed successfully!")
+        print("\nNon-blocking square movement with joint commands and IK completed successfully!")
         
     except KeyboardInterrupt:
         print("\nInterrupted by user")
