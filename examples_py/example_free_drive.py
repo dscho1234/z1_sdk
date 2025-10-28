@@ -29,12 +29,9 @@ from scipy.spatial.transform import Rotation as R
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "lib"))
 import unitree_arm_interface
 
-try:
-    import pyrealsense2 as rs
-    REALSENSE_AVAILABLE = True
-except ImportError:
-    print("Warning: pyrealsense2 not available. Camera functionality will be disabled.")
-    REALSENSE_AVAILABLE = False
+
+import pyrealsense2 as rs
+
 
 # Set numpy print options
 np.set_printoptions(precision=3, suppress=True)
@@ -58,6 +55,7 @@ class FreeDriveDataCollector:
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, "depth_images"), exist_ok=True)
         
         
         # Initialize robot arm
@@ -67,8 +65,8 @@ class FreeDriveDataCollector:
         
         # Initialize camera if available
         self.camera_available = False
-        if REALSENSE_AVAILABLE:
-            self._init_camera()
+        
+        self._init_camera()
         
         # Data collection parameters
         
@@ -86,6 +84,7 @@ class FreeDriveDataCollector:
         self.T_matrices_data = []
         self.timestamps_data = []
         self.images_data = []  # Store images in memory for batch saving
+        self.depth_images_data = []  # Store depth images in memory for batch saving
         
         print(f"Data collector initialized. Output directory: {output_dir}")
         print(f"Camera available: {self.camera_available}")
@@ -104,6 +103,9 @@ class FreeDriveDataCollector:
             
             # Configure color stream
             config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+            config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+            # 정렬 필터 설정 (depth와 color 프레임 정렬)
+            self.align = rs.align(rs.stream.color)
             
             # Start streaming
             self.pipeline.start(config)
@@ -205,8 +207,8 @@ class FreeDriveDataCollector:
             print("\n=== Camera Intrinsic Parameters ===")
             print(f"Width: {intrinsics.width}")
             print(f"Height: {intrinsics.height}")
-            print(f"Focal Length (fx, fy): ({intrinsics.fx:.2f}, {intrinsics.fy:.2f})")
-            print(f"Principal Point (cx, cy): ({intrinsics.ppx:.2f}, {intrinsics.ppy:.2f})")
+            print(f"Focal Length (fx, fy): ({intrinsics.fx:.6f}, {intrinsics.fy:.6f})")
+            print(f"Principal Point (cx, cy): ({intrinsics.ppx:.6f}, {intrinsics.ppy:.6f})")
             print(f"Distortion Model: {intrinsics.model}")
             print(f"Distortion Coefficients: {intrinsics.coeffs}")
             print("=====================================\n")
@@ -223,14 +225,19 @@ class FreeDriveDataCollector:
         try:
             # Wait for frames
             frames = self.pipeline.wait_for_frames()
-            color_frame = frames.get_color_frame()
+            aligned_frames = self.align.process(frames)
+
+            color_frame = aligned_frames.get_color_frame()
+            depth_frame = aligned_frames.get_depth_frame()
+
             
             if not color_frame:
                 return None
             
             # Convert to numpy array
             image = np.asanyarray(color_frame.get_data())
-            return image
+            depth = np.asanyarray(depth_frame.get_data()) # uint16
+            return image, depth
             
         except Exception as e:
             print(f"Error capturing image: {e}")
@@ -253,7 +260,7 @@ class FreeDriveDataCollector:
         try:
             while True:
                 # Capture image
-                image = self._capture_image()
+                image, depth = self._capture_image()
                 if image is not None:
                     # Get robot state for real-time display
                     robot_state = self._get_robot_state()
@@ -299,8 +306,10 @@ class FreeDriveDataCollector:
                         cv2.putText(display_image, "Robot state unavailable", 
                                   (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
                     
-                    # Show image
+                    # Show color image
                     cv2.imshow('Camera Stream - Press q to quit, c to capture', display_image)
+                    
+                    
                     
                     # Check for key press with longer wait time
                     key = cv2.waitKey(30) & 0xFF
@@ -312,9 +321,10 @@ class FreeDriveDataCollector:
                         print(f"\nCapturing frame {len(self.images_data) + 1}...")
                         if robot_state is not None:
                             image_stored = self._store_image(image)
+                            depth_stored = self._store_depth_image(depth)
                             data_stored = self._store_robot_data(robot_state)
                             
-                            if image_stored and data_stored:
+                            if image_stored and depth_stored and data_stored:
                                 print(f"✓ Frame captured successfully! Total: {len(self.images_data)}")
                                 # Print robot state info
                                 joint_angles = robot_state['joint_angles']
@@ -324,7 +334,9 @@ class FreeDriveDataCollector:
                             else:
                                 print("✗ Failed to capture frame")
                                 if not image_stored:
-                                    print("  - Image storage failed")
+                                    print("  - Color image storage failed")
+                                if not depth_stored:
+                                    print("  - Depth image storage failed")
                                 if not data_stored:
                                     print("  - Robot data storage failed")
                         else:
@@ -398,6 +410,25 @@ class FreeDriveDataCollector:
             print(f"Error storing image: {e}")
             return False
     
+    def _store_depth_image(self, depth_image):
+        """Store depth image in memory for batch saving."""
+        try:
+            if depth_image is not None:
+                # Check if depth image has valid dimensions
+                if len(depth_image.shape) == 2:
+                    self.depth_images_data.append(depth_image.copy())
+                    print(f"Depth image stored successfully. Shape: {depth_image.shape}")
+                    return True
+                else:
+                    print(f"Invalid depth image shape: {depth_image.shape}")
+                    return False
+            else:
+                print("Depth image is None, cannot store")
+                return False
+        except Exception as e:
+            print(f"Error storing depth image: {e}")
+            return False
+    
     def _store_robot_data(self, robot_state):
         """Store robot data in arrays for batch saving."""
         try:
@@ -447,7 +478,7 @@ class FreeDriveDataCollector:
             
             # Save all images at once
             if self.images_data:
-                print("Saving images...")
+                print("Saving color images...")
                 images_saved = 0
                 for i, image in enumerate(self.images_data):
                     if image is not None:
@@ -460,9 +491,28 @@ class FreeDriveDataCollector:
                             print(f"Warning: Failed to save image {i}")
                     else:
                         print(f"Warning: Image {i} is None, skipping...")
-                print(f"Saved {images_saved}/{len(self.images_data)} images to: {os.path.join(self.output_dir, 'images')}")
+                print(f"Saved {images_saved}/{len(self.images_data)} color images to: {os.path.join(self.output_dir, 'images')}")
             else:
-                print("No images to save.")
+                print("No color images to save.")
+            
+            # Save all depth images at once
+            if self.depth_images_data:
+                print("Saving depth images...")
+                depth_images_saved = 0
+                for i, depth_image in enumerate(self.depth_images_data):
+                    if depth_image is not None:
+                        os.makedirs(os.path.join(self.output_dir, "depth_images"), exist_ok=True)
+                        depth_image_path = os.path.join(self.output_dir, "depth_images", f"depth_{i:04d}.png")
+                        success = cv2.imwrite(depth_image_path, depth_image)
+                        if success:
+                            depth_images_saved += 1
+                        else:
+                            print(f"Warning: Failed to save depth image {i}")
+                    else:
+                        print(f"Warning: Depth image {i} is None, skipping...")
+                print(f"Saved {depth_images_saved}/{len(self.depth_images_data)} depth images to: {os.path.join(self.output_dir, 'depth_images')}")
+            else:
+                print("No depth images to save.")
             
             return True
             
@@ -587,7 +637,7 @@ def main():
     output_dir = f"free_drive_data_{timestamp}"
     
     # Camera resolution options: "VGA" (640x480), "HD" (1280x720), "FHD" (1920x1080)
-    resolution = "FHD"  # Change this to "VGA", "HD", or "FHD" as needed
+    resolution = "VGA" # "FHD"  # Change this to "VGA", "HD", or "FHD" as needed
     
     # Create data collector
     collector = FreeDriveDataCollector(output_dir=output_dir, resolution=resolution)
@@ -611,7 +661,8 @@ def main():
         print(f"- Successful collection steps: {successful_steps}")
         print(f"- Output directory: {collector.output_dir}")
         if successful_steps > 0:
-            print(f"- Images saved: {collector.output_dir}/images/")
+            print(f"- Color images saved: {collector.output_dir}/images/")
+            print(f"- Depth images saved: {collector.output_dir}/depth_images/")
             print(f"- Robot data saved: {collector.output_dir}/robot_data.pkl")
         else:
             print("- No data was saved (only warmup completed)")

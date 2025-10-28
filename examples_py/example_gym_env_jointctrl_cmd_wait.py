@@ -169,7 +169,46 @@ def generate_action_sequence(base_position, base_orientation, base_gripper, squa
     
     return sequence
 
+def get_debug_data():
+    import zarr
+    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_eye_calib_debug"
+    data_buffer = zarr.open(data_buffer_path, mode="a")
+    episode_idx = 0
+    dift_point_tracking_sequence = data_buffer[f"episode_{episode_idx}/dift_point_tracking_sequence"][:, :, :3].copy().transpose(1, 0, 2) # [N, T, 4 -> 3] -> [T, N, 3] camera frame
+    T_mc_transformation = data_buffer[f"episode_{episode_idx}/T_mc_opt"][:].copy() # [T, 4, 4]
+    assert dift_point_tracking_sequence.shape[0] == T_mc_transformation.shape[0]
+    
 
+    T_B_M = np.array([[-0.0211232, 0.00961882, -0.99973061, 0.87401688],
+                [ 0.00934025, -0.99990818, -0.00981788,  0.0965125 ],
+                [-0.99973325, -0.00954512,  0.02103141,  0.54736933],
+                [ 0.,          0.,          0.,          1.        ]])
+                
+    T_bc_transformation = np.einsum('ij,hjk->hik', T_B_M, T_mc_transformation) # [T, 4, 4]
+    
+
+    T, N, _ = dift_point_tracking_sequence.shape
+    
+    # Convert to homogeneous coordinates: [T, N, 3] -> [T, N, 4]
+    camera_points_homo = np.concatenate([
+        dift_point_tracking_sequence, 
+        np.ones((T, N, 1))
+    ], axis=2)  # [T, N, 4]
+    
+    # Reshape for batch matrix multiplication: [T, N, 4] -> [T*N, 4]
+    camera_points_homo_flat = camera_points_homo.reshape(-1, 4)  # [T*N, 4]
+    
+    # Expand transformation matrices: [T, 4, 4] -> [T*N, 4, 4]
+    T_bc_expanded = np.repeat(T_bc_transformation, N, axis=0)  # [T*N, 4, 4]
+    
+    # Batch matrix multiplication: [T*N, 4, 4] @ [T*N, 4] -> [T*N, 4]
+    base_points_homo_flat = np.einsum('ijk,ik->ij', T_bc_expanded, camera_points_homo_flat)  # [T*N, 4]
+    
+    # Convert back to 3D coordinates and reshape: [T*N, 4] -> [T*N, 3] -> [T, N, 3]
+    dift_point_base_frame = base_points_homo_flat[:, :3].reshape(T, N, 3)  # [T, N, 3]
+
+    
+    return dift_point_base_frame
 
 
 def main():
@@ -241,7 +280,8 @@ def main():
         # dscho debug to specify the position and orientation
         original_position = np.array([0.41145274, -0.00121779, 0.40713578])
         # Convert from [w,x,y,z] to [x,y,z,w] format for scipy compatibility
-        current_orientation_wxyz = np.array([0.9998209, -0.0011671, -0.01868073, -0.00280654])  # [w,x,y,z]
+        # current_orientation_wxyz = np.array([0.9998209, -0.0011671, -0.01868073, -0.00280654])  # [w,x,y,z]
+        current_orientation_wxyz = np.array([1.0, 0.0, 0.0, 0.0])  # [w,x,y,z]
         current_orientation = np.array([current_orientation_wxyz[1], current_orientation_wxyz[2], 
                                        current_orientation_wxyz[3], current_orientation_wxyz[0]])  # [x,y,z,w]
 
@@ -263,9 +303,21 @@ def main():
             original_position + np.array([0.0, 0.0, 0.0])            # Back to start
         ]
 
+        # NOTE
+        dift_point_base_frame = get_debug_data() # [T, N, 3]
+        DEBUG_POINT = dift_point_base_frame[0,0] + np.array([0.0, 0.0, 0.1])
         
+        DEBUG_ACTION = np.concatenate([DEBUG_POINT, current_orientation,  np.array([0.0])])
+        print('@@@@@@@@@@@@@@@@@@@@@@@@@ Currently using DEBUG_ACTION :', DEBUG_ACTION)
+
+        
+        DEBUG_ROLL_ANGLES = [0, 0, 0, 0, 0]
         # Define orientation vertices with roll changes: 0°, +90°, 0°, -90°, 0°
-        roll_angles = [0, np.pi/4, 0, -np.pi/4, 0]  # 0°, +90°, 0°, -90°, 0°
+        # roll_angles = [0, np.pi/4, 0, -np.pi/4, 0]  # 0°, +90°, 0°, -90°, 0°
+        
+        roll_angles = DEBUG_ROLL_ANGLES
+        
+        
         orientation_vertices = []
         
         for roll_angle in roll_angles:
@@ -333,7 +385,11 @@ def main():
             print(f"Step {step}: Executing action a_{step} with non-blocking...")
             
             start = time.time()
-            env.step(action, wait=False) # a_t
+            
+            # env.step(action, wait=False) # a_t
+            env.step(DEBUG_ACTION, wait=False) # a_t
+
+
             print(f"Step {step}: Started non-blocking execution in {time.time() - start:.6f}s")
             
             # Run inference in main process while robot is moving (step > 0 and not last step)

@@ -19,6 +19,17 @@ from scipy.spatial.transform import Rotation as R
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "envs"))
 from envs.z1_env_rtc_wait_mp import EEPoseCtrlCartesianCmdWrapper
 
+# # custom (hand-made)
+T_B_M = np.array([[-0.0211232, 0.00961882, -0.99973061, 0.92401688],
+                [ 0.00934025, -0.99990818, -0.00981788,  0.0865125 ],
+                [-0.99973325, -0.00954512,  0.02103141,  0.57736933],
+                [ 0.,          0.,          0.,          1.        ]])
+
+# original [0.5507966 , 0.12502528, 0.28048738]
+# T_B_M = np.array([[-0.0211232, 0.00961882, -0.99973061, 0.87401688],
+#                 [ 0.00934025, -0.99990818, -0.00981788,  0.0965125 ],
+#                 [-0.99973325, -0.00954512,  0.02103141,  0.54736933],
+#                 [ 0.,          0.,          0.,          1.        ]])
 
 class DummyMLP(nn.Module):
     """Simple dummy MLP model for thread-torch compatibility testing."""
@@ -162,7 +173,103 @@ def generate_action_sequence(base_position, base_orientation, base_gripper, squa
     
     return sequence
 
+def get_dift_point_base_frame_data_for_debug():
+    import zarr
+    # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_eye_calib_debug"
+    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_pose_calib_debug"
+    data_buffer = zarr.open(data_buffer_path, mode="a")
+    episode_idx = 0
+    dift_point_tracking_sequence = data_buffer[f"episode_{episode_idx}/dift_point_tracking_sequence"][:, :, :3].copy().transpose(1, 0, 2) # [N, T, 4 -> 3] -> [T, N, 3] camera frame
+    T_mc_transformation = data_buffer[f"episode_{episode_idx}/T_mc_opt"][:].copy() # [T, 4, 4]
+    assert dift_point_tracking_sequence.shape[0] == T_mc_transformation.shape[0]
+    
 
+    
+                
+    T_bc_transformation = np.einsum('ij,hjk->hik', T_B_M, T_mc_transformation) # [T, 4, 4]
+    
+
+    T, N, _ = dift_point_tracking_sequence.shape
+    
+    # Convert to homogeneous coordinates: [T, N, 3] -> [T, N, 4]
+    camera_points_homo = np.concatenate([
+        dift_point_tracking_sequence, 
+        np.ones((T, N, 1))
+    ], axis=2)  # [T, N, 4]
+    
+    # Reshape for batch matrix multiplication: [T, N, 4] -> [T*N, 4]
+    camera_points_homo_flat = camera_points_homo.reshape(-1, 4)  # [T*N, 4]
+    
+    # Expand transformation matrices: [T, 4, 4] -> [T*N, 4, 4]
+    T_bc_expanded = np.repeat(T_bc_transformation, N, axis=0)  # [T*N, 4, 4]
+    T_mc_expanded = np.repeat(T_mc_transformation, N, axis=0)  # [T*N, 4, 4]
+    
+    # Batch matrix multiplication: [T*N, 4, 4] @ [T*N, 4] -> [T*N, 4]
+    base_points_homo_flat = np.einsum('ijk,ik->ij', T_bc_expanded, camera_points_homo_flat)  # [T*N, 4]
+    marker_points_homo_flat = np.einsum('ijk,ik->ij', T_mc_expanded, camera_points_homo_flat)  # [T*N, 4]
+    
+    # Convert back to 3D coordinates and reshape: [T*N, 4] -> [T*N, 3] -> [T, N, 3]
+    dift_point_base_frame = base_points_homo_flat[:, :3].reshape(T, N, 3)  # [T, N, 3]
+    dift_point_marker_frame = marker_points_homo_flat[:, :3].reshape(T, N, 3)  # [T, N, 3]
+
+    
+    return dift_point_base_frame, dift_point_marker_frame
+
+def get_estimated_hand_pose_base_frame_data_for_debug():
+    import zarr
+    # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_eye_calib_debug"
+    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_pose_calib_debug"
+    data_buffer = zarr.open(data_buffer_path, mode="a")
+    episode_idx = 0
+    T_mc_transformation = data_buffer[f"episode_{episode_idx}/T_mc_opt"][:].copy() # [T, 4, 4]
+    T = T_mc_transformation.shape[0]
+
+    # original ver
+    # proprioception = data_buffer[f"episode_{episode_idx}/proprioception"][:].copy() # [T, 7], camera frame
+
+    # NOTE: for debug
+    import pickle
+    def load_data_dict(data_path):
+        """Load the data dictionary from pickle file"""
+        with open(data_path, 'rb') as f:
+            data_dict = pickle.load(f)
+        return data_dict
+
+    data_dict = load_data_dict(data_buffer_path + f'/episode_{episode_idx}/data_dict.pkl')
+    
+    # use first obs
+    R_cg_opt = data_dict['R_cg_opt_trajectory'][:][0] # [3, 3]
+    t_cg_opt_depth = data_dict['t_cg_opt_depth_trajectory'][:][0] # [3]
+    t_cg_opt = data_dict['t_cg_opt_trajectory'][:][0] # [3]
+    euler_cg_opt = R.from_matrix(R_cg_opt).as_euler('xyz') # [3]
+    temp_gripper = np.array([0.0])
+    # dscho NOTE: depth-based one is much better
+    proprioception = np.tile(np.concatenate([t_cg_opt_depth, euler_cg_opt, temp_gripper], axis=-1), (T, 1)) # [T, 7]
+    # proprioception = np.tile(np.concatenate([t_cg_opt, euler_cg_opt, temp_gripper], axis=-1), (T, 1)) # [T, 7]
+
+
+
+    
+    
+    assert proprioception.shape[0] == T_mc_transformation.shape[0]
+    
+    T = proprioception.shape[0]
+    proprioception_se3 = np.tile(np.eye(4), (T, 1, 1)) # [T, 4, 4]
+    proprioception_se3[:, :3, :3] = R.from_euler('xyz', proprioception[:, 3:6]).as_matrix() # [T, 4, 4]
+    proprioception_se3[:, :3, 3] = proprioception[:, :3] # [T, 4, 4]
+
+    T_bc_transformation = np.einsum('ij,hjk->hik', T_B_M, T_mc_transformation) # [T, 4, 4]
+    proprioception_se3_b = np.einsum('hij,hjk->hik', T_bc_transformation, proprioception_se3) # [T, 4, 4]
+    
+    pos = proprioception_se3_b[:, :3, 3] # [T, 3]
+    euler = R.from_matrix(proprioception_se3_b[:, :3, :3]).as_euler('xyz')
+    proprioception_b = np.concatenate([pos, euler, proprioception[:, 6:7]], axis=1) # [T, 7]
+    return proprioception_b
+    
+
+
+    
+    
 
 
 def main():
@@ -235,7 +342,8 @@ def main():
         
         # dscho debug to specify the position and orientation
         original_position = np.array([0.41145274, -0.00121779, 0.40713578])
-        current_orientation_wxyz = np.array([0.9998209, -0.0011671, -0.01868073, -0.00280654])  # [w,x,y,z]
+        # current_orientation_wxyz = np.array([0.9998209, -0.0011671, -0.01868073, -0.00280654])  # [w,x,y,z]
+        current_orientation_wxyz = np.array([1.0, 0.0, 0.0, 0.0])  # [w,x,y,z]
         current_orientation = np.array([current_orientation_wxyz[1], current_orientation_wxyz[2], 
                                        current_orientation_wxyz[3], current_orientation_wxyz[0]])  # [x,y,z,w]
 
@@ -258,8 +366,24 @@ def main():
         ]
 
 
+        # NOTE
+        # dift_point_base_frame, dift_point_marker_frame = get_dift_point_base_frame_data_for_debug() # [T, N, 3]
+        # DEBUG_POINT = dift_point_base_frame[0,1] + np.array([0.0, 0.0, 0.1])
+
+        proprioception_base_frame = get_estimated_hand_pose_base_frame_data_for_debug() # [T, 7]
+        DEBUG_POINT = proprioception_base_frame[0, :3] # + np.array([0.0, 0.0, 0.1])
+        
+        
+        
+        DEBUG_ACTION = np.concatenate([DEBUG_POINT, current_orientation,  np.array([0.0])])
+        print('@@@@@@@@@@@@@@@@@@@@@@@@@ Currently using DEBUG_ACTION :', DEBUG_ACTION)
+
+        
+        DEBUG_ROLL_ANGLES = [0, 0, 0, 0, 0]
         # Define orientation vertices with roll changes: 0°, +90°, 0°, -90°, 0°
-        roll_angles = [0, np.pi/4, 0, -np.pi/4, 0]  # 0°, +90°, 0°, -90°, 0°
+        # roll_angles = [0, np.pi/4, 0, -np.pi/4, 0]  # 0°, +90°, 0°, -90°, 0°
+        
+        roll_angles = DEBUG_ROLL_ANGLES
         orientation_vertices = []
         
         for roll_angle in roll_angles:
@@ -327,7 +451,10 @@ def main():
             print(f"Step {step}: Executing action a_{step} with non-blocking...")
             
             start = time.time()
-            env.step(action, wait=False) # a_t
+
+            # env.step(action, wait=False) # a_t
+            env.step(DEBUG_ACTION, wait=False) # a_t
+
             print(f"Step {step}: Started non-blocking execution in {time.time() - start:.6f}s")
             
             # Run inference in main process while robot is moving (step > 0 and not last step)

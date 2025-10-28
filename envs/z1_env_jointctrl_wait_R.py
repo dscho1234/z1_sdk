@@ -367,6 +367,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
                  orientation_tolerance: float = 0.1,
                  joint_speed: float = 1.0,
                  sequence_length: int = 10,
+                 use_current_joint_pos_when_ik_fails = False,
                  ):
         """
         Initialize the end-effector pose control wrapper using joint commands with RTC support.
@@ -381,7 +382,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             
         """
         super().__init__(has_gripper, control_frequency)
-        
+        self.use_current_joint_pos_when_ik_fails = use_current_joint_pos_when_ik_fails
         self.position_tolerance = position_tolerance
         self.orientation_tolerance = orientation_tolerance
         self.joint_speed = joint_speed
@@ -922,11 +923,13 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             initial_guess=current_joint_pos,
             max_iterations=20,
             tolerance=1e-2,
-            tolerance_null=1e-3
+            tolerance_null=1e-4
         )
         if not success:
             print(f"Warning: IK failed to converge (error: {final_error:.6f}, null_obj: {null_obj_val:.6f}), using current joint positions")
-            target_joint_pos = current_joint_pos.copy()
+            if self.use_current_joint_pos_when_ik_fails:
+                target_joint_pos = current_joint_pos.copy()
+            
         else:
             print(f"IK solved successfully in {iterations} iterations (error: {final_error:.6f}, null_obj: {null_obj_val:.6f})")
     

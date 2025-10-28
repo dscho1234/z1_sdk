@@ -545,13 +545,22 @@ def main():
 
         # Define square vertices in YZ plane (0.1m x 0.1m square)
         square_size = 0.1  # 0.1m
+        # square_vertices = [
+        #     original_position + np.array([0.0, 0.0, 0.0]),           # Start point
+        #     original_position + np.array([0.0, square_size, 0.0]),   # Y+0.1
+        #     original_position + np.array([0.0, square_size, square_size]),  # Y+0.1, Z+0.1
+        #     original_position + np.array([0.0, 0.0, square_size]),   # Z+0.1
+        #     original_position + np.array([0.0, 0.0, 0.0])            # Back to start
+        # ]
+
         square_vertices = [
             original_position + np.array([0.0, 0.0, 0.0]),           # Start point
+            original_position + np.array([0.0, 0.0, -square_size]),   # Z-0.1
+            original_position + np.array([0.0, square_size, -square_size]),  # Y+0.1, Z-0.1
             original_position + np.array([0.0, square_size, 0.0]),   # Y+0.1
-            original_position + np.array([0.0, square_size, square_size]),  # Y+0.1, Z+0.1
-            original_position + np.array([0.0, 0.0, square_size]),   # Z+0.1
             original_position + np.array([0.0, 0.0, 0.0])            # Back to start
         ]
+
         
         # Define orientation vertices with roll changes: 0°, +90°, 0°, -90°, 0°
         roll_angles = [0, np.pi/4, 0, -np.pi/4, 0]  # 0°, +90°, 0°, -90°, 0°
@@ -572,7 +581,7 @@ def main():
 
         
         total_steps = 30
-        inference_time = 0.15  # Inference time in seconds
+        inference_time = 0.45  # Inference time in seconds
         
         print(f"Running non-blocking control with overlapped inference for {total_steps} steps")
         print(f"Inference time: {inference_time}s")
