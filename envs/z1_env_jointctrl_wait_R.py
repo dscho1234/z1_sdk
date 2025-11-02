@@ -391,6 +391,10 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         # Store previous step's joint directions for continuous movement during inference
         self.previous_joint_directions = np.zeros(7)  # [J1, J2, J3, J4, J5, J6, gripper]
         self.has_previous_directions = False
+        # Store previous iteration's chosen target joint positions (for IK fallback comparison)
+        self.prev_target_joint_pos = None
+        self.prev_final_error = None
+        self.prev_null_obj_val = None
         
         # Non-blocking inference system using multiprocessing
         self.action_queue = Queue()
@@ -474,6 +478,9 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         
         # Reset previous directions flag for first step calculation
         self.has_previous_directions = False
+        self.prev_target_joint_pos = None
+        self.prev_final_error = None
+        self.prev_null_obj_val = None
         
         # Create step thread once during reset for reuse
         if not self.step_thread_created:
@@ -923,15 +930,39 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             initial_guess=current_joint_pos,
             max_iterations=20,
             tolerance=1e-2,
-            tolerance_null=1e-4
+            tolerance_null=1e-3
         )
         if not success:
-            print(f"Warning: IK failed to converge (error: {final_error:.6f}, null_obj: {null_obj_val:.6f}), using current joint positions")
+            print(f"Warning: IK failed to converge (error: {final_error:.6f}, null_obj: {null_obj_val:.6f})")
             if self.use_current_joint_pos_when_ik_fails:
                 target_joint_pos = current_joint_pos.copy()
-            
+                # Do not update prev metrics here since we didn't select a solver-produced q
+            else:
+                # Compare using previous stored (final_error, null_obj_val) vs current iteration's
+                use_prev = False
+                if self.prev_final_error is not None and self.prev_null_obj_val is not None and self.prev_target_joint_pos is not None:
+                    # Lexicographic comparison: prioritize final_error, then null_obj_val
+                    prev_pair = (self.prev_final_error, self.prev_null_obj_val)
+                    curr_pair = (final_error, null_obj_val)
+                    if (prev_pair[0] < curr_pair[0]) or (np.isclose(prev_pair[0], curr_pair[0]) and prev_pair[1] < curr_pair[1]):
+                        use_prev = True
+                # Select the q with smaller error metrics
+                if use_prev:
+                    print(f"IK fallback: using prev q (prev_err={self.prev_final_error:.6f}, prev_null={self.prev_null_obj_val:.6f}) vs curr_err={final_error:.6f}, curr_null={null_obj_val:.6f}")
+                    target_joint_pos = self.prev_target_joint_pos.copy()
+                    # Keep previous metrics as they correspond to chosen q
+                else:
+                    print(f"IK fallback: using current q from solver (curr_err={final_error:.6f}, curr_null={null_obj_val:.6f})")
+                    # Update previous metrics to current since we chose current q
+                    self.prev_final_error = final_error
+                    self.prev_null_obj_val = null_obj_val
         else:
             print(f"IK solved successfully in {iterations} iterations (error: {final_error:.6f}, null_obj: {null_obj_val:.6f})")
+            # On success, update previous metrics to current
+            self.prev_final_error = final_error
+            self.prev_null_obj_val = null_obj_val
+        # Remember chosen target q for next iteration's comparison
+        self.prev_target_joint_pos = target_joint_pos.copy()
     
         
         # Calculate joint position error
