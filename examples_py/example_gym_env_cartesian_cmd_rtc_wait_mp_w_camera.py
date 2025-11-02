@@ -21,11 +21,17 @@ from scipy.spatial.transform import Rotation as R
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "envs"))
 from envs.z1_env_rtc_wait_mp import EEPoseCtrlCartesianCmdWrapper
 
-# # custom (hand-made)
-T_B_M = np.array([[-0.0211232, 0.00961882, -0.99973061, 0.86901688],
-                [ 0.00934025, -0.99990818, -0.00981788,  0.0965125 ],
-                [-0.99973325, -0.00954512,  0.02103141,  0.55736933],
+# # custom (hand-made), 3x5 charuco reference marker: 1
+T_B_M = np.array([[0.00000000, 0.00000000, 1.00000000, 0.86901688],
+                [ 0.00000000, -1.00000000, 0.00000000,  0.0715125 ],
+                [1.00000000, 0.00000000,  0.00000000,  0.57236933],
                 [ 0.,          0.,          0.,          1.        ]])
+
+# # # custom (hand-made)
+# T_B_M = np.array([[-0.0211232, 0.00961882, -0.99973061, 0.86901688],
+#                 [ 0.00934025, -0.99990818, -0.00981788,  0.0965125 ],
+#                 [-0.99973325, -0.00954512,  0.02103141,  0.55736933],
+#                 [ 0.,          0.,          0.,          1.        ]])
 
 # original (accurate value when we make the robot to reach the [0,0,0.4] in marker coordinate) [0.5507966 , 0.12502528, 0.28048738]
 # T_B_M = np.array([[-0.0211232, 0.00961882, -0.99973061, 0.87401688],
@@ -766,7 +772,8 @@ def get_dift_point_base_frame_data_for_debug(camera_matrix=None, dist_coeffs=Non
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_eye_calib_debug"
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_pose_calib_debug"
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug"
-    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug_w_wrist_depth_scale"
+    # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug_w_wrist_depth_scale"
+    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/charuco_marker_test_for_hand_pose_calib_debug"
     
     data_buffer = zarr.open(data_buffer_path, mode="a")
     episode_idx = 0
@@ -816,7 +823,8 @@ def get_dift_point_base_frame_data_for_debug(camera_matrix=None, dist_coeffs=Non
 
 
 
-    point_in_front_of_the_marker_homo = np.array([0.0, 0.0, 0.4, 1.0])
+    # point_in_front_of_the_marker_homo = np.array([0.0, 0.0, 0.4, 1.0])
+    point_in_front_of_the_marker_homo = np.array([0.0, 0.0, -0.4, 1.0])
     point_in_front_of_the_marker_base_frame = np.einsum('ij,j->i', T_B_M, point_in_front_of_the_marker_homo)[:3]
 
     
@@ -828,7 +836,8 @@ def get_estimated_hand_pose_base_frame_data_for_debug():
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_pose_calib_debug"
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug"
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug_w_dist_coeff"
-    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug_w_wrist_depth_scale"
+    # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug_w_wrist_depth_scale"
+    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/charuco_marker_test_for_hand_pose_calib_debug"
     data_buffer = zarr.open(data_buffer_path, mode="a")
     episode_idx = 0
     T_mc_transformation = data_buffer[f"episode_{episode_idx}/T_mc_opt"][:].copy() # [T, 4, 4]
@@ -860,9 +869,9 @@ def get_estimated_hand_pose_base_frame_data_for_debug():
     # proprioception = np.concatenate([t_cg_closed, euler_cg_opt, temp_gripper], axis=-1) # [T, 7]
 
     # debugging (depth scaling)
-    proprioception[:, :3] = proprioception[:, :3] # * 1.05 # 2.5% scaling (custom calibration)
-    print("@@@@@@@@@@@@@@@@@@@@@@@@@ apply scaling to the proprioception for debugging")
-    time.sleep(2)
+    # proprioception[:, :3] = proprioception[:, :3] * 1.05 # 2.5% scaling (custom calibration)
+    # print("@@@@@@@@@@@@@@@@@@@@@@@@@ apply scaling to the proprioception for debugging")
+    # time.sleep(2)
 
 
     
@@ -881,7 +890,6 @@ def get_estimated_hand_pose_base_frame_data_for_debug():
     euler = R.from_matrix(proprioception_se3_b[:, :3, :3]).as_euler('xyz')
     proprioception_b = np.concatenate([pos, euler, proprioception[:, 6:7]], axis=1) # [T, 7]
     return proprioception_b, proprioception
-    
 
 
     
@@ -1203,6 +1211,9 @@ def main():
         position_errors = []
         orientation_errors = []
         
+        # Store images and errors for batch saving
+        image_data_list = []  # List of dicts: {'step': int, 'image': np.ndarray, 'pos_error': float, 'orient_error': float}
+        
         # Sequence tracking variables
         current_action_sequence = None
         current_action_index = 0
@@ -1332,10 +1343,8 @@ def main():
                     cv2.putText(vis_rgb, f"camera_data", (u + 20, v),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 
-                # Save visualization (every 10 steps to avoid too many files)
-                if step % 10 == 0:
-                    cv2.imwrite(f"camera_data_projection_step_{step:04d}.png", vis_rgb)
-                    print(f"Step {step}: Saved projected camera_data visualization")
+                # Store image for batch saving (errors will be added later)
+                image_data_list.append({'step': step, 'image': vis_rgb.copy(), 'pos_error': None, 'orient_error': None})
         
                 # ========== Transform camera_data: Camera → Marker → Base ==========
                 camera_data_base_frame = None
@@ -1462,6 +1471,13 @@ def main():
             position_errors.append(info['position_error'])
             orientation_errors.append(info['orientation_error'])
             
+            # Update error info in the corresponding image data entry (find by step number)
+            for img_data in image_data_list:
+                if img_data['step'] == step:
+                    img_data['pos_error'] = info['position_error']
+                    img_data['orient_error'] = info['orientation_error']
+                    break
+            
             if done:
                 print(f"Episode finished at step {step}!")
                 break
@@ -1490,6 +1506,35 @@ def main():
             print(f"  Average orientation error: {avg_orientation_error:.4f} rad")
             print(f"  Total steps executed: {len(position_errors)}")
             print(f" last step error: {position_errors[-1]:.4f} m, {orientation_errors[-1]:.4f} rad")
+        
+        # Save all images with error text to camera_proj_result folder
+        print("\nSaving all images to camera_proj_result folder...")
+        output_dir = "camera_proj_result"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        for img_data in image_data_list:
+            step_num = img_data['step']
+            img = img_data['image'].copy()
+            pos_err = img_data['pos_error']
+            orient_err = img_data['orient_error']
+            
+            # Add error text to image
+            if pos_err is not None and orient_err is not None:
+                # Position error text
+                pos_text = f"Pos Error: {pos_err:.4f} m"
+                cv2.putText(img, pos_text, (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                # Orientation error text
+                orient_text = f"Orient Error: {orient_err:.4f} rad"
+                cv2.putText(img, orient_text, (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            # Save image
+            filename = os.path.join(output_dir, f"camera_data_projection_step_{step_num:04d}.png")
+            cv2.imwrite(filename, img)
+        
+        print(f"Saved {len(image_data_list)} images to {output_dir}/")
         
         print()
         print("\nNon-blocking square movement with sequence handling completed successfully!")

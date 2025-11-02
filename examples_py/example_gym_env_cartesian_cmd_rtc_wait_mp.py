@@ -19,11 +19,18 @@ from scipy.spatial.transform import Rotation as R
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "envs"))
 from envs.z1_env_rtc_wait_mp import EEPoseCtrlCartesianCmdWrapper
 
-# # custom (hand-made)
-T_B_M = np.array([[-0.0211232, 0.00961882, -0.99973061, 0.86901688],
-                [ 0.00934025, -0.99990818, -0.00981788,  0.0865125 ],
-                [-0.99973325, -0.00954512,  0.02103141,  0.55736933],
+# # custom (hand-made), 3x5 charuco reference marker: 1
+T_B_M = np.array([[0.00000000, 0.00000000, 1.00000000, 0.86901688],
+                [ 0.00000000, -1.00000000, 0.00000000,  0.0715125 ],
+                [1.00000000, 0.00000000,  0.00000000,  0.57236933],
                 [ 0.,          0.,          0.,          1.        ]])
+
+
+# # # custom (hand-made)
+# T_B_M = np.array([[-0.0211232, 0.00961882, -0.99973061, 0.86901688],
+#                 [ 0.00934025, -0.99990818, -0.00981788,  0.0865125 ],
+#                 [-0.99973325, -0.00954512,  0.02103141,  0.55736933],
+#                 [ 0.,          0.,          0.,          1.        ]])
 
 # original (accurate value when we make the robot to reach the [0,0,0.4] in marker coordinate) [0.5507966 , 0.12502528, 0.28048738]
 # T_B_M = np.array([[-0.0211232, 0.00961882, -0.99973061, 0.87401688],
@@ -173,21 +180,70 @@ def generate_action_sequence(base_position, base_orientation, base_gripper, squa
     
     return sequence
 
-def get_dift_point_base_frame_data_for_debug():
+def backproject_pixel(K, u, v, depth, dist_coeffs=None):
+    """
+    Backproject a 2D pixel coordinate to 3D point in camera coordinates.
+    If dist_coeffs is provided, undistorts the pixel coordinate first.
+    
+    Args:
+        K: (3,3) camera intrinsic matrix
+        u, v: pixel coordinates
+        depth: depth value (z coordinate in camera frame)
+        dist_coeffs: (5,) or None, distortion coefficients
+    
+    Returns:
+        point3d: (3,) 3D point in camera coordinates
+    """
+    if dist_coeffs is not None:
+        # Undistort the pixel coordinate first
+        pixel = np.array([[u, v]], dtype=np.float32)
+        pixel_undist = cv2.undistortPoints(pixel, K, dist_coeffs, P=K)
+        u_undist = pixel_undist[0, 0, 0]
+        v_undist = pixel_undist[0, 0, 1]
+    else:
+        u_undist = u
+        v_undist = v
+    
+    fx, fy = K[0,0], K[1,1]
+    cx, cy = K[0,2], K[1,2]
+    z = depth
+    x = (u_undist - cx) * z / fx
+    y = (v_undist - cy) * z / fy
+    return np.array([x, y, z])
+    
+def get_dift_point_base_frame_data_for_debug(camera_matrix=None, dist_coeffs=None):
     import zarr
+    from im2flow2act.common.utility.zarr import parallel_reading
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_eye_calib_debug"
-    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_pose_calib_debug"
+    # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_pose_calib_debug"
+    # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug"
+    # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug_w_wrist_depth_scale"
+    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/charuco_marker_test_for_hand_pose_calib_debug"
+    
     data_buffer = zarr.open(data_buffer_path, mode="a")
     episode_idx = 0
     dift_point_tracking_sequence = data_buffer[f"episode_{episode_idx}/dift_point_tracking_sequence"][:, :, :3].copy().transpose(1, 0, 2) # [N, T, 4 -> 3] -> [T, N, 3] camera frame
     T_mc_transformation = data_buffer[f"episode_{episode_idx}/T_mc_opt"][:].copy() # [T, 4, 4]
+    dift_points = data_buffer[f"episode_{episode_idx}/dift_points"][:].copy() # [N, 2]
     assert dift_point_tracking_sequence.shape[0] == T_mc_transformation.shape[0]
     
-                
+    T, N, _ = dift_point_tracking_sequence.shape
     T_bc_transformation = np.einsum('ij,hjk->hik', T_B_M, T_mc_transformation) # [T, 4, 4]
     
 
-    T, N, _ = dift_point_tracking_sequence.shape
+    dift_points_custom_unprojected_list = []
+    depth = parallel_reading(group=data_buffer[f"episode_{episode_idx}/camera_0"], array_name="depth")[0].astype(np.float32) / 1000.0
+    for dift_x, dift_y in dift_points:
+        dift_points_custom_unprojected = backproject_pixel(camera_matrix, dift_x, dift_y, depth[dift_y, dift_x], dist_coeffs=dist_coeffs)
+        dift_points_custom_unprojected_list.append(dift_points_custom_unprojected)
+    dift_points_custom_unprojected = np.tile(np.stack(dift_points_custom_unprojected_list), (T, 1, 1)) # [T, N, 3]
+    dift_points_custom_unprojected_c_homo = np.concatenate([dift_points_custom_unprojected, np.ones((T, N, 1))], axis=2) # [T, N, 4]
+    dift_points_custom_unprojected_c = dift_points_custom_unprojected.copy()
+    # [T, 4, 4] @ [T, N, 4] -> [T, N, 4]
+    dift_points_custom_unprojected_b = np.einsum('hij,hkj->hki', T_bc_transformation, dift_points_custom_unprojected_c_homo)[:, :, :3]
+
+
+    
     
     # Convert to homogeneous coordinates: [T, N, 3] -> [T, N, 4]
     camera_points_homo = np.concatenate([
@@ -212,16 +268,21 @@ def get_dift_point_base_frame_data_for_debug():
 
 
 
-    point_in_front_of_the_marker_homo = np.array([0.0, 0.0, 0.4, 1.0])
+    # point_in_front_of_the_marker_homo = np.array([0.0, 0.0, 0.4, 1.0])
+    point_in_front_of_the_marker_homo = np.array([0.0, 0.0, -0.4, 1.0])
     point_in_front_of_the_marker_base_frame = np.einsum('ij,j->i', T_B_M, point_in_front_of_the_marker_homo)[:3]
 
     
-    return dift_point_base_frame, dift_point_marker_frame, dift_point_tracking_sequence, point_in_front_of_the_marker_base_frame
+    return dift_point_base_frame, dift_point_marker_frame, dift_point_tracking_sequence, point_in_front_of_the_marker_base_frame, dift_points_custom_unprojected_c, dift_points_custom_unprojected_b
 
 def get_estimated_hand_pose_base_frame_data_for_debug():
     import zarr
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_eye_calib_debug"
-    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_pose_calib_debug"
+    # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_pose_calib_debug"
+    # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug"
+    # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug_w_dist_coeff"
+    # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug_w_wrist_depth_scale"
+    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/charuco_marker_test_for_hand_pose_calib_debug"
     data_buffer = zarr.open(data_buffer_path, mode="a")
     episode_idx = 0
     T_mc_transformation = data_buffer[f"episode_{episode_idx}/T_mc_opt"][:].copy() # [T, 4, 4]
@@ -253,9 +314,9 @@ def get_estimated_hand_pose_base_frame_data_for_debug():
     # proprioception = np.concatenate([t_cg_closed, euler_cg_opt, temp_gripper], axis=-1) # [T, 7]
 
     # debugging (depth scaling)
-    proprioception[:, :3] = proprioception[:, :3] * 1.05 # 2.5% scaling (custom calibration)
-    print("@@@@@@@@@@@@@@@@@@@@@@@@@ apply scaling to the proprioception for debugging")
-    time.sleep(2)
+    # proprioception[:, :3] = proprioception[:, :3] * 1.05 # 2.5% scaling (custom calibration)
+    # print("@@@@@@@@@@@@@@@@@@@@@@@@@ apply scaling to the proprioception for debugging")
+    # time.sleep(2)
 
 
     
@@ -274,9 +335,6 @@ def get_estimated_hand_pose_base_frame_data_for_debug():
     euler = R.from_matrix(proprioception_se3_b[:, :3, :3]).as_euler('xyz')
     proprioception_b = np.concatenate([pos, euler, proprioception[:, 6:7]], axis=1) # [T, 7]
     return proprioception_b, proprioception
-    
-
-
     
     
 

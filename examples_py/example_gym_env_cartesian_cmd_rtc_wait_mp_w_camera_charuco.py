@@ -16,15 +16,24 @@ import torch.nn as nn
 import cv2
 import pyrealsense2 as rs
 from scipy.spatial.transform import Rotation as R
+import matplotlib.pyplot as plt
+import signal
+import atexit
 
 # Add the envs directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "envs"))
 from envs.z1_env_rtc_wait_mp import EEPoseCtrlCartesianCmdWrapper
 
 # # custom (hand-made), 3x5 charuco reference marker: 1
-T_B_M = np.array([[0.00000000, 0.00000000, 1.00000000, 0.86901688],
-                [ 0.00000000, -1.00000000, 0.00000000,  0.0715125 ],
-                [1.00000000, 0.00000000,  0.00000000,  0.57236933],
+# T_B_M = np.array([[0.00000000, 0.00000000, 1.00000000, 0.76401688],
+#                 [ 0.00000000, -1.00000000, 0.00000000,  0.0615125 ],
+#                 [1.00000000, 0.00000000,  0.00000000,  0.56736933],
+#                 [ 0.,          0.,          0.,          1.        ]])
+
+# # custom (hand-made), 3x5 charuco reference marker: 1 (lowest table)
+T_B_M = np.array([[0.00000000, 0.00000000, 1.00000000, 0.76401688],
+                [ 0.00000000, -1.00000000, 0.00000000,  0.0615125 ],
+                [1.00000000, 0.00000000,  0.00000000,  0.73136933],
                 [ 0.,          0.,          0.,          1.        ]])
 
 # # # custom (hand-made)
@@ -115,12 +124,12 @@ def init_realsense_camera(resolution="HD"):
         # camera_matrix = np.array([[592.5122474,    0.,         329.31307053],
         #                         [  0.,         592.41377421, 248.28416052],
         #                         [  0.,           0.,           1.        ]])
+        # dist_coeffs = np.array([ 4.32352189e-02,  4.27595321e-01,  1.99344572e-03, -7.07460350e-04, -1.65811952e+00])
         camera_matrix = np.array([[594.77780809,   0.,         330.89839472],
                                 [  0.,         594.59358254, 244.54097395],
                                 [  0.,           0.,           1.        ]])
 
-        # dist_coeffs = np.array([ 4.32352189e-02,  4.27595321e-01,  1.99344572e-03, -7.07460350e-04, -1.65811952e+00])
-        dist_coeffs = np.array([7.11160300e-02,  1.96758488e-01, -9.70781397e-05, -1.21502610e-03, -1.18364923e+00])
+        # dist_coeffs = np.array([7.11160300e-02,  1.96758488e-01, -9.70781397e-05, -1.21502610e-03, -1.18364923e+00])
         dist_coeffs = None
         
         print("\n=== Camera Intrinsic Parameters ===")
@@ -974,19 +983,23 @@ def backproject_pixel(K, u, v, depth, dist_coeffs=None):
     y = (v_undist - cy) * z / fy
     return np.array([x, y, z])
 
-def get_dift_point_base_frame_data_for_debug(camera_matrix=None, dist_coeffs=None):
+def get_dift_point_base_frame_data_for_debug(camera_matrix=None, dist_coeffs=None, droid=False):
     import zarr
     from im2flow2act.common.utility.zarr import parallel_reading
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_eye_calib_debug"
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_pose_calib_debug"
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug"
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug_w_wrist_depth_scale"
-    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/charuco_marker_test_for_hand_pose_calib_debug"
+    # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/charuco_marker_test_for_hand_pose_calib_debug"
+    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/charuco_marker_static_bottle"
     
     data_buffer = zarr.open(data_buffer_path, mode="a")
     episode_idx = 0
     dift_point_tracking_sequence = data_buffer[f"episode_{episode_idx}/dift_point_tracking_sequence"][:, :, :3].copy().transpose(1, 0, 2) # [N, T, 4 -> 3] -> [T, N, 3] camera frame
-    T_mc_transformation = data_buffer[f"episode_{episode_idx}/T_mc_opt"][:].copy() # [T, 4, 4]
+    if droid:
+        T_mc_transformation = data_buffer[f"episode_{episode_idx}/T_mc_opt_droid"][:].copy() # [T, 4, 4]
+    else:
+        T_mc_transformation = data_buffer[f"episode_{episode_idx}/T_mc_opt"][:].copy() # [T, 4, 4]
     dift_points = data_buffer[f"episode_{episode_idx}/dift_points"][:].copy() # [N, 2]
     assert dift_point_tracking_sequence.shape[0] == T_mc_transformation.shape[0]
     
@@ -1038,18 +1051,24 @@ def get_dift_point_base_frame_data_for_debug(camera_matrix=None, dist_coeffs=Non
     
     return dift_point_base_frame, dift_point_marker_frame, dift_point_tracking_sequence, point_in_front_of_the_marker_base_frame, dift_points_custom_unprojected_c, dift_points_custom_unprojected_b
 
-def get_estimated_hand_pose_base_frame_data_for_debug():
+def get_estimated_hand_pose_base_frame_data_for_debug(droid=False):
     import zarr
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_eye_calib_debug"
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_pose_calib_debug"
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug"
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug_w_dist_coeff"
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug_w_wrist_depth_scale"
-    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/charuco_marker_test_for_hand_pose_calib_debug"
+    # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/charuco_marker_test_for_hand_pose_calib_debug"
+    data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/charuco_marker_static_bottle"
     data_buffer = zarr.open(data_buffer_path, mode="a")
     episode_idx = 0
-    T_mc_transformation = data_buffer[f"episode_{episode_idx}/T_mc_opt"][:].copy() # [T, 4, 4]
+    all_detected_frame_index = data_buffer[f"episode_{episode_idx}/all_detected_frame_index"][()] # scalar
+    if droid:
+        T_mc_transformation = data_buffer[f"episode_{episode_idx}/T_mc_opt_droid"][:].copy() # [T, 4, 4]
+    else:
+        T_mc_transformation = data_buffer[f"episode_{episode_idx}/T_mc_opt"][:].copy() # [T, 4, 4]
     T = T_mc_transformation.shape[0]
+    
 
     # original ver
     # proprioception = data_buffer[f"episode_{episode_idx}/proprioception"][:].copy() # [T, 7], camera frame
@@ -1070,7 +1089,7 @@ def get_estimated_hand_pose_base_frame_data_for_debug():
     t_cg_opt = data_dict['t_cg_opt_trajectory'][:] # [T, 3]
     t_cg_closed = data_dict['t_cg_closed_trajectory'][:] # [T, 3]
     euler_cg_opt = R.from_matrix(R_cg_opt).as_euler('xyz') # [T, 3]
-    temp_gripper = np.tile(np.array([0.0]), (T, 1)) # [T, 1]
+    temp_gripper = np.tile(np.array([0.0]), (euler_cg_opt.shape[0], 1)) # [T, 1]
     # dscho NOTE: depth-based one is much smoother when using accurate T_B_M. accuracy is slightly better.
     proprioception = np.concatenate([t_cg_opt_depth, euler_cg_opt, temp_gripper], axis=-1) # [T, 7]
     # proprioception = np.concatenate([t_cg_opt, euler_cg_opt, temp_gripper], axis=-1) # [T, 7]
@@ -1084,29 +1103,114 @@ def get_estimated_hand_pose_base_frame_data_for_debug():
 
     
     
-    assert proprioception.shape[0] == T_mc_transformation.shape[0]
+    # assert proprioception.shape[0] == T_mc_transformation.shape[0]
     
-    T = proprioception.shape[0]
-    proprioception_se3 = np.tile(np.eye(4), (T, 1, 1)) # [T, 4, 4]
-    proprioception_se3[:, :3, :3] = R.from_euler('xyz', proprioception[:, 3:6]).as_matrix() # [T, 4, 4]
-    proprioception_se3[:, :3, 3] = proprioception[:, :3] # [T, 4, 4]
+    # T = proprioception.shape[0]
+    # proprioception_se3 = np.tile(np.eye(4), (T, 1, 1)) # [T, 4, 4]
+    # proprioception_se3[:, :3, :3] = R.from_euler('xyz', proprioception[:, 3:6]).as_matrix() # [T, 4, 4]
+    # proprioception_se3[:, :3, 3] = proprioception[:, :3] # [T, 4, 4]
 
-    T_bc_transformation = np.einsum('ij,hjk->hik', T_B_M, T_mc_transformation) # [T, 4, 4]
-    proprioception_se3_b = np.einsum('hij,hjk->hik', T_bc_transformation, proprioception_se3) # [T, 4, 4]
+    # T_bc_transformation = np.einsum('ij,hjk->hik', T_B_M, T_mc_transformation) # [T, 4, 4]
+    # proprioception_se3_b = np.einsum('hij,hjk->hik', T_bc_transformation, proprioception_se3) # [T, 4, 4]
     
-    pos = proprioception_se3_b[:, :3, 3] # [T, 3]
-    euler = R.from_matrix(proprioception_se3_b[:, :3, :3]).as_euler('xyz')
-    proprioception_b = np.concatenate([pos, euler, proprioception[:, 6:7]], axis=1) # [T, 7]
+    # pos = proprioception_se3_b[:, :3, 3] # [T, 3]
+    # euler = R.from_matrix(proprioception_se3_b[:, :3, :3]).as_euler('xyz')
+    # proprioception_b = np.concatenate([pos, euler, proprioception[:, 6:7]], axis=1) # [T, 7]
+
+    # temporary debug
+    proprioception_b = None
+
+
     return proprioception_b, proprioception
-    
 
 
+# ========== Global cleanup variables and functions ==========
+# Global variables to store references for cleanup
+_cleanup_env = None
+_cleanup_pipeline = None
+
+def cleanup_resources():
+    """Cleanup function that will be called on program termination.
+    This function is idempotent and can be called multiple times safely."""
+    global _cleanup_env, _cleanup_pipeline
     
-    
+    try:
+        # Check if cleanup has already been done
+        if _cleanup_env is None and _cleanup_pipeline is None:
+            return  # Already cleaned up
+        
+        print("\n[Cleanup] Starting resource cleanup...")
+        
+        # Close environment
+        if _cleanup_env is not None:
+            try:
+                print("[Cleanup] Closing environment...")
+                _cleanup_env.close()
+                print("[Cleanup] Environment closed.")
+                _cleanup_env = None  # Clear reference after cleanup
+            except Exception as e:
+                print(f"[Cleanup] Error closing environment: {e}")
+                _cleanup_env = None  # Clear reference even on error
+        
+        # Stop camera pipeline
+        if _cleanup_pipeline is not None:
+            try:
+                print("[Cleanup] Stopping RealSense camera pipeline...")
+                _cleanup_pipeline.stop()
+                print("[Cleanup] RealSense camera pipeline stopped.")
+                _cleanup_pipeline = None  # Clear reference after cleanup
+            except Exception as e:
+                print(f"[Cleanup] Error stopping camera pipeline: {e}")
+                _cleanup_pipeline = None  # Clear reference even on error
+        
+        print("[Cleanup] Resource cleanup completed.")
+    except Exception as e:
+        print(f"[Cleanup] Error during cleanup: {e}")
+        # Try to clear references on error
+        try:
+            _cleanup_env = None
+            _cleanup_pipeline = None
+        except:
+            pass
+
+def signal_handler(signum, frame):
+    """Handle system signals to ensure cleanup."""
+    try:
+        signal_name = signal.Signals(signum).name
+        print(f"\n[Signal Handler] Received signal: {signal_name} ({signum})")
+        print("[Signal Handler] Executing cleanup...")
+        cleanup_resources()
+        
+        # For fatal signals, exit cleanly after cleanup
+        # For non-fatal signals like SIGINT, we can let Python handle it
+        if signum in (signal.SIGABRT, signal.SIGSEGV):
+            print("[Signal Handler] Fatal signal received. Exiting after cleanup...")
+            sys.exit(1)
+        elif signum == signal.SIGTERM:
+            print("[Signal Handler] Termination signal received. Exiting after cleanup...")
+            sys.exit(0)
+        # For SIGINT, allow KeyboardInterrupt to be raised naturally
+    except Exception as e:
+        print(f"[Signal Handler] Error in signal handler: {e}")
+        sys.exit(1)
 
 
 def main():
     """Main example function."""
+    global _cleanup_env, _cleanup_pipeline
+    
+    # Register cleanup handlers for signals and normal exit
+    print("Registering cleanup handlers...")
+    atexit.register(cleanup_resources)
+    
+    # Register signal handlers for various termination signals
+    signal.signal(signal.SIGABRT, signal_handler)  # Abort signal (core dump)
+    signal.signal(signal.SIGSEGV, signal_handler)  # Segmentation fault
+    signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+    signal.signal(signal.SIGINT, signal_handler)   # Keyboard interrupt (Ctrl+C)
+    print("Cleanup handlers registered.")
+    print("=" * 80)
+    
     print("Z1 Gym Environment Example - Non-blocking Step Execution")
     print("=" * 80)
     
@@ -1131,6 +1235,9 @@ def main():
         sequence_length=sequence_length,  # Length of future sequences
         
     )
+    
+    # Store env in global variable for cleanup
+    _cleanup_env = env
     
     print(f"Action space: {env.action_space}")
     print(f"Observation space: {env.observation_space}")
@@ -1182,9 +1289,14 @@ def main():
         
         pipeline, align, camera_matrix, dist_coeffs, cam_success = init_realsense_camera(resolution="VGA")
         
+        # Store pipeline in global variable for cleanup
+        _cleanup_pipeline = pipeline
+        
+        droid = True
         if not cam_success:
             print("Warning: Camera initialization failed. Continuing without camera...")
             pipeline = None
+            _cleanup_pipeline = None  # Also clear global
             align = None
             camera_matrix = None
             dist_coeffs = None
@@ -1217,11 +1329,11 @@ def main():
         # D435 depth-based dift point (leftside bottle cap): array([0.592886  , 0.24988669, 0.1399751 ]), (on the socket): array([ 0.58816114, -0.0290327 , -0.00381193]), 
         # unidepth-based dift point (leftside bottle cap): array([0.62878956, 0.22977131, 0.13334631]), (on the socket): array([0.52487209, 0.02690133, 0.01839266]), 
         # NOTE
-        dift_point_base_frame, dift_point_marker_frame, dift_point_camera_frame, point_in_front_of_the_marker_base_frame, dift_points_custom_unprojected_c, dift_points_custom_unprojected_b = get_dift_point_base_frame_data_for_debug(camera_matrix=camera_matrix, dist_coeffs=dist_coeffs) # [T, N, 3]
+        dift_point_base_frame, dift_point_marker_frame, dift_point_camera_frame, point_in_front_of_the_marker_base_frame, dift_points_custom_unprojected_c, dift_points_custom_unprojected_b = get_dift_point_base_frame_data_for_debug(camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, droid=droid) # [T, N, 3]
         # DEBUG_POINT = dift_point_base_frame[0,1] + np.array([0.0, 0.0, 0.1])
         # DEBUG_POINT = point_in_front_of_the_marker_base_frame
 
-        proprioception_base_frame, proprioception_camera_frame = get_estimated_hand_pose_base_frame_data_for_debug() # [T, 7]
+        proprioception_base_frame, proprioception_camera_frame = get_estimated_hand_pose_base_frame_data_for_debug(droid=droid) # [T, 7]
         # DEBUG_POINT = proprioception_base_frame[0, :3] # + np.array([0.0, 0.0, 0.1])
         
         
@@ -1285,97 +1397,91 @@ def main():
         T_cm_reference = None  # Camera to reference marker transformation
         T_mc = None  # Reference marker to camera transformation
         
-        if cam_success:
-            print("\n" + "=" * 80)
-            print("Detecting ChArUco Markers (Before Loop)")
-            print("=" * 80)
+    
+        print("\n" + "=" * 80)
+        print("Detecting ChArUco Markers (Before Loop)")
+        print("=" * 80)
+        
+        # Capture initial RGB image for marker detection
+        rgb_init, depth_init, capture_success = capture_realsense_image(pipeline, align)
+        
+    
+        print("Successfully captured initial RGB and depth images for marker detection")
+        
+        # 2) ChArUco 보드 검출 및 자세 추정
+    
+        # Convert to grayscale for ChArUco detection
+        gray_init = cv2.cvtColor(rgb_init, cv2.COLOR_BGR2GRAY)
+        
+        # Detect ChArUco board
+        board_success, charuco_corners, charuco_ids, marker_corners, marker_ids, rvec_board, tvec_board = detect_charuco_board(
+            gray_init, board, camera_matrix, dist_coeffs
+        )
+        
+        if board_success:
+            print(f"Successfully detected ChArUco Board!")
             
-            # Capture initial RGB image for marker detection
-            rgb_init, depth_init, capture_success = capture_realsense_image(pipeline, align)
+            # 3) 보드 자세로부터 각 마커의 개별 자세 계산
+            T_cam_marker_dict, T_cam_board = compute_marker_poses_from_board(
+                board, rvec_board, tvec_board, marker_ids, marker_corners
+            )
             
-            if capture_success:
-                print("Successfully captured initial RGB and depth images for marker detection")
-                
-                # 2) ChArUco 보드 검출 및 자세 추정
-                if board is not None:
-                    # Convert to grayscale for ChArUco detection
-                    gray_init = cv2.cvtColor(rgb_init, cv2.COLOR_BGR2GRAY)
-                    
-                    # Detect ChArUco board
-                    board_success, charuco_corners, charuco_ids, marker_corners, marker_ids, rvec_board, tvec_board = detect_charuco_board(
-                        gray_init, board, camera_matrix, dist_coeffs
-                    )
-                    
-                    if board_success:
-                        print(f"Successfully detected ChArUco Board!")
-                        
-                        # 3) 보드 자세로부터 각 마커의 개별 자세 계산
-                        T_cam_marker_dict, T_cam_board = compute_marker_poses_from_board(
-                            board, rvec_board, tvec_board, marker_ids, marker_corners
-                        )
-                        
-                        # Use reference marker as specified in config
-                        if reference_marker_id in T_cam_marker_dict:
-                            T_cm_reference = T_cam_marker_dict[reference_marker_id]
-                        else:
-                            # Reference marker not detected, use board pose or first detected marker
-                            if len(T_cam_marker_dict) > 0:
-                                # Fallback to first detected marker
-                                reference_marker_id = list(T_cam_marker_dict.keys())[0]
-                                T_cm_reference = T_cam_marker_dict[reference_marker_id]
-                                print(f"Warning: Reference marker not detected, using first detected marker {reference_marker_id}")
-                            else:
-                                # No markers detected, use board pose
-                                print(f"Warning: No markers detected, using board pose as reference")
-                                T_cm_reference = T_cam_board
-                        
-                        print(f"Using marker {reference_marker_id} as reference")
-                        print(f"T_cm_reference (Camera to Marker {reference_marker_id}):\n{T_cm_reference}")
-                        print(f"Detected markers: {len(T_cam_marker_dict)} markers")
-                        
-                        # Visualize detected markers
-                        vis_image = rgb_init.copy()
-                        if marker_corners is not None and marker_ids is not None:
-                            cv2.aruco.drawDetectedMarkers(vis_image, marker_corners, marker_ids)
-                        
-                        # Draw board pose axes
-                        cv2.drawFrameAxes(vis_image, camera_matrix, dist_coeffs, rvec_board, tvec_board, square_size_m * 2.0)
-                        
-                        # Draw individual marker axes (optional, using computed poses)
-                        for marker_id, T_cm in T_cam_marker_dict.items():
-                            rvec, _ = cv2.Rodrigues(T_cm[:3, :3])
-                            tvec = T_cm[:3, 3]
-                            color = (0, 255, 0) if marker_id == reference_marker_id else (255, 0, 0)
-                            cv2.drawFrameAxes(vis_image, camera_matrix, dist_coeffs, rvec, tvec, marker_size_m * 0.5)
-                            # Draw marker ID text
-                            cv2.putText(vis_image, f"ID:{marker_id}", tuple((tvec[:2] * 100).astype(int)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                        
-                        # Save visualization
-                        cv2.imwrite("aruco_detection_init.png", vis_image)
-                        print("Saved ChArUco detection visualization to: aruco_detection_init.png")
-                        
-                        # Calculate T_mc (reference marker to camera) = inv(T_cm_reference)
-                        T_mc = np.linalg.inv(T_cm_reference)
-                        print(f"T_mc (Marker {reference_marker_id} to Camera):\n{T_mc}")
-                    else:
-                        print("Warning: Failed to detect ChArUco board. Continuing without marker detection...")
-                        T_mc = None
-                else:
-                    print("Warning: ChArUco board not initialized. Continuing without marker detection...")
-                    T_mc = None
+            # Use reference marker as specified in config
+            if reference_marker_id in T_cam_marker_dict:
+                T_cm_reference = T_cam_marker_dict[reference_marker_id]
             else:
-                print("Warning: Failed to capture initial images. Continuing without marker detection...")
-                T_mc = None
+                # Reference marker not detected, use board pose or first detected marker
+                if len(T_cam_marker_dict) > 0:
+                    # Fallback to first detected marker
+                    reference_marker_id = list(T_cam_marker_dict.keys())[0]
+                    T_cm_reference = T_cam_marker_dict[reference_marker_id]
+                    print(f"Warning: Reference marker not detected, using first detected marker {reference_marker_id}")
+                else:
+                    # No markers detected, use board pose
+                    print(f"Warning: No markers detected, using board pose as reference")
+                    T_cm_reference = T_cam_board
+            
+            print(f"Using marker {reference_marker_id} as reference")
+            print(f"T_cm_reference (Camera to Marker {reference_marker_id}):\n{T_cm_reference}")
+            print(f"Detected markers: {len(T_cam_marker_dict)} markers")
+            
+            # Visualize detected markers
+            vis_image = rgb_init.copy()
+            if marker_corners is not None and marker_ids is not None:
+                cv2.aruco.drawDetectedMarkers(vis_image, marker_corners, marker_ids)
+            
+            # Draw board pose axes
+            cv2.drawFrameAxes(vis_image, camera_matrix, dist_coeffs, rvec_board, tvec_board, square_size_m * 2.0)
+            
+            # Draw individual marker axes (optional, using computed poses)
+            for marker_id, T_cm in T_cam_marker_dict.items():
+                rvec, _ = cv2.Rodrigues(T_cm[:3, :3])
+                tvec = T_cm[:3, 3]
+                color = (0, 255, 0) if marker_id == reference_marker_id else (255, 0, 0)
+                cv2.drawFrameAxes(vis_image, camera_matrix, dist_coeffs, rvec, tvec, marker_size_m * 0.5)
+                # Draw marker ID text
+                cv2.putText(vis_image, f"ID:{marker_id}", tuple((tvec[:2] * 100).astype(int)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # Save visualization
+            cv2.imwrite("aruco_detection_init.png", vis_image)
+            print("Saved ChArUco detection visualization to: aruco_detection_init.png")
+            
+            # Calculate T_mc (reference marker to camera) = inv(T_cm_reference)
+            T_mc = np.linalg.inv(T_cm_reference)
+            print(f"T_mc (Marker {reference_marker_id} to Camera):\n{T_mc}")
         else:
-            print("Warning: Camera not available. Skipping ChArUco marker detection...")
-            T_mc = None
-        
-        
+            raise NotImplementedError("Board-based detection is required. Individual marker visualization fallback is not implemented.")
         
         # Track errors for average calculation
         position_errors = []
         orientation_errors = []
+        
+        # Store images and errors for batch saving
+        image_data_list = []  # List of dicts: {'step': int, 'image': np.ndarray, 'pos_error': float, 'orient_error': float}
+        
+        # Store T_mc_current transformations for analysis
+        T_mc_current_list = []  # List of T_mc_current (4x4) matrices
         
         # Sequence tracking variables
         current_action_sequence = None
@@ -1390,6 +1496,13 @@ def main():
         current_action_index = 0
         
         # Main execution loop for all steps
+        # T_mc_current will be updated after each env.step() completion
+        T_mc_current = T_mc  # Initialize with pre-computed T_mc from before loop
+        
+        # Store initial T_mc for step=0
+        if T_mc_current is not None:
+            T_mc_current_list.append(T_mc_current.copy())
+        
         for step in range(total_steps):
             print(f"\nStep {step}: Processing")
             print("-" * 40)
@@ -1400,134 +1513,22 @@ def main():
             print(f"\nUsing temporary camera_data (camera frame): {camera_data}")
             print("Note: Replace this with actual camera_data from your detection/estimation")
             
-            # ========== Capture RGB and Depth Images ==========
-            if cam_success and pipeline is not None:
-                rgb_step, depth_step, capture_success = capture_realsense_image(pipeline, align)
-                
-                # ========== Detect ArUco Board (per frame) ==========
-                T_mc_current = T_mc  # Use initial T_mc as fallback
-                corners_step = None
-                ids_step = None
-                reference_marker_id_step = reference_marker_id  # Use same reference marker as initial
-                
-                if capture_success and board is not None:
-                    # 2) ChArUco 보드 검출 및 자세 추정 (per frame)
-                    gray_step = cv2.cvtColor(rgb_step, cv2.COLOR_BGR2GRAY)
-                    
-                    board_success_step, charuco_corners_step, charuco_ids_step, marker_corners_step, marker_ids_step, rvec_board_step, tvec_board_step = detect_charuco_board(
-                        gray_step, board, camera_matrix, dist_coeffs
-                    )
-                    
-                    corners_step = marker_corners_step
-                    ids_step = marker_ids_step
-                    
-                    if board_success_step:
-                        # 3) 보드 자세로부터 각 마커의 개별 자세 계산
-                        T_cam_marker_dict_step, T_cam_board_step = compute_marker_poses_from_board(
-                            board, rvec_board_step, tvec_board_step, marker_ids_step, marker_corners_step
-                        )
-                        
-                        # Use reference marker as specified in config
-                        if reference_marker_id_step in T_cam_marker_dict_step:
-                            T_cm_reference_step = T_cam_marker_dict_step[reference_marker_id_step]
-                        else:
-                            # Reference marker not detected, use board pose or first detected marker
-                            if len(T_cam_marker_dict_step) > 0:
-                                # Fallback to first detected marker
-                                reference_marker_id_step = list(T_cam_marker_dict_step.keys())[0]
-                                T_cm_reference_step = T_cam_marker_dict_step[reference_marker_id_step]
-                            else:
-                                # No markers detected, use board pose
-                                T_cm_reference_step = T_cam_board_step
-                        
-                        # Update T_mc for current frame
-                        T_mc_current = np.linalg.inv(T_cm_reference_step)
-                        
-                        if step % 10 == 0:  # Print every 10 steps to avoid too much output
-                            print(f"Step {step}: Detected ChArUco Board with {len(T_cam_marker_dict_step)} markers")
-                            print(f"Step {step}: Using marker {reference_marker_id_step} as reference")
-                    else:
-                        if step % 10 == 0:
-                            print(f"Step {step}: No ChArUco board detected, using previous T_mc")
-                elif capture_success:
-                    if step % 10 == 0:
-                        print(f"Step {step}: ChArUco board not initialized, using previous T_mc")
+            # ========== Transform camera_data: Camera → Marker → Base (before step) ==========
+            # We use T_mc_current which was computed before this iteration
+            # For step=0: uses T_mc computed before loop
+            # For step>0: uses T_mc_current updated after previous step's env.step() completion
+            camera_data_base_frame = None
             
-                # ========== Project camera_data to RGB Image ==========
-                point_2d, visible = project_3d_to_image(camera_data, camera_matrix)
-                
-                # Draw projected point on RGB image
-                vis_rgb = rgb_step.copy()
-                
-                # Draw detected markers if available
-                if capture_success and corners_step is not None:
-                    cv2.aruco.drawDetectedMarkers(vis_rgb, corners_step, ids_step)
-                    
-                    # Draw board pose if available (from board detection)
-                    if board is not None and 'rvec_board_step' in locals() and rvec_board_step is not None:
-                        # Draw board axes (larger, represents entire board)
-                        cv2.drawFrameAxes(vis_rgb, camera_matrix, dist_coeffs, rvec_board_step, tvec_board_step, square_size_m * 2.0)
-                        
-                        # Draw individual marker axes if computed
-                        if 'T_cam_marker_dict_step' in locals():
-                            for marker_id, T_cm_step in T_cam_marker_dict_step.items():
-                                rvec_step, _ = cv2.Rodrigues(T_cm_step[:3, :3])
-                                tvec_step = T_cm_step[:3, 3]
-                                color = (0, 255, 0) if marker_id == reference_marker_id_step else (255, 0, 0)
-                                cv2.drawFrameAxes(vis_rgb, camera_matrix, dist_coeffs, rvec_step, tvec_step, marker_size_m * 0.5)
-                    else:
-                        # Fallback: draw individual markers (not implemented)
-                        # raise NotImplementedError("Board-based detection is required. Individual marker visualization fallback is not implemented.")
-                        # Note: This code is kept for future use but not implemented
-                        pass
-                        # if 'marker_poses_dict_step' in locals() and len(marker_poses_dict_step) > 0:
-                        #     for marker_id, T_cm_step in marker_poses_dict_step.items():
-                        #         rvec_step, _ = cv2.Rodrigues(T_cm_step[:3, :3])
-                        #         tvec_step = T_cm_step[:3, 3]
-                        #         color = (0, 255, 0) if marker_id == reference_marker_id_step else (255, 0, 0)
-                        #         cv2.drawFrameAxes(vis_rgb, camera_matrix, dist_coeffs, rvec_step, tvec_step, marker_size * 0.5)
-                
-                u, v = int(point_2d[0]), int(point_2d[1])
-                if 0 <= u < vis_rgb.shape[1] and 0 <= v < vis_rgb.shape[0]:
-                    cv2.circle(vis_rgb, (u, v), 10, (0, 0, 255), -1)  # Red circle
-                    cv2.circle(vis_rgb, (u, v), 15, (255, 255, 255), 2)  # White outline
-                    cv2.putText(vis_rgb, f"camera_data", (u + 20, v),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                
-                # Save visualization (every 10 steps to avoid too many files)
-                if step % 10 == 0:
-                    cv2.imwrite(f"camera_data_projection_step_{step:04d}.png", vis_rgb)
-                    print(f"Step {step}: Saved projected camera_data visualization")
-        
-                # ========== Transform camera_data: Camera → Marker → Base ==========
-                camera_data_base_frame = None
-                
-                if T_mc_current is not None:
-                    # Transform camera_data from camera frame to marker frame
-                    # T_mc = inv(T_cm), so: marker_point = T_mc @ camera_point
-                    camera_data_homo = np.concatenate([camera_data, [1.0]])  # [x, y, z, 1]
-                    camera_data_marker_homo = T_mc_current @ camera_data_homo
-                    camera_data_marker = camera_data_marker_homo[:3]
-                    
-                    if step % 10 == 0:  # Print every 10 steps
-                        print(f"Step {step}: camera_data (camera frame): {camera_data}")
-                        print(f"Step {step}: camera_data (marker frame): {camera_data_marker}")
-                    
-                    # Transform from marker frame to base frame
-                    # base_point = T_B_M @ marker_point
-                    camera_data_marker_homo = np.concatenate([camera_data_marker, [1.0]])
-                    camera_data_base_homo = T_B_M @ camera_data_marker_homo
-                    camera_data_base_frame = camera_data_base_homo[:3]
-                    
-                    if step % 10 == 0:  # Print every 10 steps
-                        print(f"Step {step}: camera_data (base frame): {camera_data_base_frame}")
-                else:
-                    print(f"Step {step}: T_mc is None, skipping marker-based transformation")
-            
-                
+            if cam_success and pipeline is not None and T_mc_current is not None:
+                # Transform camera_data using current T_mc (no image capture here)
+                camera_data_homo = np.concatenate([camera_data, [1.0]])
+                camera_data_marker_homo = T_mc_current @ camera_data_homo
+                camera_data_marker = camera_data_marker_homo[:3]
+                camera_data_marker_homo = np.concatenate([camera_data_marker, [1.0]])
+                camera_data_base_homo = T_B_M @ camera_data_marker_homo
+                camera_data_base_frame = camera_data_base_homo[:3]
             else:
                 print(f"Step {step}: Camera not available, using fallback")
-                # Fallback
                 if 'proprioception_base_frame' in locals() and step < len(proprioception_base_frame):
                     camera_data_base_frame = proprioception_base_frame[step, :3]
                 else:
@@ -1620,9 +1621,113 @@ def main():
             gripper_state = obs[19] if len(obs) > 19 else 0.0
             print(f"Step {step}: Gripper State = {gripper_state:.3f}")
             
+            # ========== Capture RGB and Depth Images and Update T_mc (AFTER env.step is complete) ==========
+            # This updated T_mc_current will be used in the NEXT iteration for camera_data transformation
+            if cam_success and pipeline is not None:
+                rgb_step, depth_step, capture_success = capture_realsense_image(pipeline, align)
+                
+                # ========== Detect ChArUco Board and Update T_mc_current ==========
+                corners_step = None
+                ids_step = None
+                reference_marker_id_step = reference_marker_id  # Use same reference marker as initial
+                
+                if capture_success and board is not None:
+                    charuco_start = time.time()
+                    # ChArUco 보드 검출 및 자세 추정
+                    gray_step = cv2.cvtColor(rgb_step, cv2.COLOR_BGR2GRAY)
+                    
+                    board_success_step, charuco_corners_step, charuco_ids_step, marker_corners_step, marker_ids_step, rvec_board_step, tvec_board_step = detect_charuco_board(
+                        gray_step, board, camera_matrix, dist_coeffs
+                    )
+                    
+                    corners_step = marker_corners_step
+                    ids_step = marker_ids_step
+                    
+                    if board_success_step:
+                        # 보드 자세로부터 각 마커의 개별 자세 계산
+                        T_cam_marker_dict_step, T_cam_board_step = compute_marker_poses_from_board(
+                            board, rvec_board_step, tvec_board_step, marker_ids_step, marker_corners_step
+                        )
+                        
+                        # Use reference marker as specified in config
+                        if reference_marker_id_step in T_cam_marker_dict_step:
+                            T_cm_reference_step = T_cam_marker_dict_step[reference_marker_id_step]
+                        else:
+                            # Reference marker not detected, use board pose or first detected marker
+                            if len(T_cam_marker_dict_step) > 0:
+                                # Fallback to first detected marker
+                                reference_marker_id_step = list(T_cam_marker_dict_step.keys())[0]
+                                T_cm_reference_step = T_cam_marker_dict_step[reference_marker_id_step]
+                            else:
+                                # No markers detected, use board pose
+                                T_cm_reference_step = T_cam_board_step
+                        
+                        # Update T_mc_current for use in next iteration
+                        T_mc_current = np.linalg.inv(T_cm_reference_step)
+                        
+                        # Store T_mc_current for analysis
+                        T_mc_current_list.append(T_mc_current.copy())
+                        
+                        if step % 10 == 0:  # Print every 10 steps to avoid too much output
+                            print(f"Step {step}: Detected ChArUco Board with {len(T_cam_marker_dict_step)} markers")
+                            print(f"Step {step}: Using marker {reference_marker_id_step} as reference")
+                            print(f"Step {step}: Updated T_mc_current for next iteration")
+                    else:
+                        print(f"Step {step}: No ChArUco board detected, keeping previous T_mc_current")
+                    
+                    print(f"Step {step}: ChArUco board detection time: {time.time() - charuco_start:.6f}s")
+                    
+                elif capture_success:
+                    raise NotImplementedError("ChArUco board detection is required. Board-based detection fallback is not implemented.")
+            
+                # ========== Project camera_data to RGB Image (AFTER step) ==========
+                point_2d, visible = project_3d_to_image(camera_data, camera_matrix)
+                
+                # Draw projected point on RGB image
+                vis_rgb = rgb_step.copy()
+                
+                # Draw detected markers if available
+                if capture_success and corners_step is not None:
+                    cv2.aruco.drawDetectedMarkers(vis_rgb, corners_step, ids_step)
+                    
+                    # Draw board pose if available (from board detection)
+                    if board is not None and 'rvec_board_step' in locals() and rvec_board_step is not None:
+                        # Draw board axes (larger, represents entire board)
+                        cv2.drawFrameAxes(vis_rgb, camera_matrix, dist_coeffs, rvec_board_step, tvec_board_step, square_size_m * 2.0)
+                        
+                        # Draw individual marker axes if computed
+                        if 'T_cam_marker_dict_step' in locals():
+                            for marker_id, T_cm_step in T_cam_marker_dict_step.items():
+                                rvec_step, _ = cv2.Rodrigues(T_cm_step[:3, :3])
+                                tvec_step = T_cm_step[:3, 3]
+                                color = (0, 255, 0) if marker_id == reference_marker_id_step else (255, 0, 0)
+                                cv2.drawFrameAxes(vis_rgb, camera_matrix, dist_coeffs, rvec_step, tvec_step, marker_size_m * 0.5)
+                    else:
+                        # Fallback: draw individual markers (not implemented)
+                        # raise NotImplementedError("Board-based detection is required. Individual marker visualization fallback is not implemented.")
+                        # Note: This code is kept for future use but not implemented
+                        pass
+                
+                u, v = int(point_2d[0]), int(point_2d[1])
+                if 0 <= u < vis_rgb.shape[1] and 0 <= v < vis_rgb.shape[0]:
+                    cv2.circle(vis_rgb, (u, v), 10, (0, 0, 255), -1)  # Red circle
+                    cv2.circle(vis_rgb, (u, v), 15, (255, 255, 255), 2)  # White outline
+                    cv2.putText(vis_rgb, f"camera_data", (u + 20, v),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                
+                # Store image for batch saving (errors will be added later)
+                image_data_list.append({'step': step, 'image': vis_rgb.copy(), 'pos_error': None, 'orient_error': None})
+            
             # Collect errors for average calculation
             position_errors.append(info['position_error'])
             orientation_errors.append(info['orientation_error'])
+            
+            # Update error info in the corresponding image data entry (find by step number)
+            for img_data in image_data_list:
+                if img_data['step'] == step:
+                    img_data['pos_error'] = info['position_error']
+                    img_data['orient_error'] = info['orientation_error']
+                    break
             
             if done:
                 print(f"Episode finished at step {step}!")
@@ -1653,6 +1758,151 @@ def main():
             print(f"  Total steps executed: {len(position_errors)}")
             print(f" last step error: {position_errors[-1]:.4f} m, {orientation_errors[-1]:.4f} rad")
         
+        # Save all images with error text to camera_proj_result folder
+        print("\nSaving all images to camera_proj_result folder...")
+        output_dir = "camera_proj_result"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        for img_data in image_data_list:
+            step_num = img_data['step']
+            img = img_data['image'].copy()
+            pos_err = img_data['pos_error']
+            orient_err = img_data['orient_error']
+            
+            # Add error text to image
+            if pos_err is not None and orient_err is not None:
+                # Position error text
+                pos_text = f"Pos Error: {pos_err:.4f} m"
+                cv2.putText(img, pos_text, (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                # Orientation error text
+                orient_text = f"Orient Error: {orient_err:.4f} rad"
+                cv2.putText(img, orient_text, (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            # Save image
+            filename = os.path.join(output_dir, f"camera_data_projection_step_{step_num:04d}.png")
+            cv2.imwrite(filename, img)
+        
+        print(f"Saved {len(image_data_list)} images to {output_dir}/")
+        
+        # ========== Analyze T_mc_current variations ==========
+        if len(T_mc_current_list) > 0 and T_mc is not None:
+            print("\nAnalyzing T_mc_current variations...")
+            
+            # Convert list to numpy array for easier processing
+            T_mc_current_array = np.array(T_mc_current_list)  # [N, 4, 4]
+            
+            # Calculate relative transformations: T_rel = T_mc_current @ inv(T_mc)
+            # This gives the transformation from initial marker frame to current marker frame
+            T_mc_inv = np.linalg.inv(T_mc)
+            T_relative_list = []
+            
+            for T_mc_curr in T_mc_current_list:
+                T_rel = T_mc_curr @ T_mc_inv  # Relative transformation
+                T_relative_list.append(T_rel)
+            
+            T_relative_array = np.array(T_relative_list)  # [N, 4, 4]
+            
+            # Extract position and orientation changes
+            # Position: translation part of T_rel
+            position_changes = T_relative_array[:, :3, 3]  # [N, 3] (x, y, z changes)
+            
+            # Orientation: euler angles from rotation matrix
+            euler_changes_list = []
+            for T_rel in T_relative_list:
+                R_rel = T_rel[:3, :3]
+                euler_rel = R.from_matrix(R_rel).as_euler('xyz')  # roll, pitch, yaw
+                euler_changes_list.append(euler_rel)
+            euler_changes = np.array(euler_changes_list)  # [N, 3] (roll, pitch, yaw changes)
+            
+            # Create figure with 2 subplots
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+            
+            # Subplot 1: Position changes (x, y, z)
+            steps = np.arange(len(position_changes))
+            
+            # Normalize position changes to [0, 1] for RGB color mapping
+            pos_normalized = position_changes.copy()
+            if len(position_changes) > 0:
+                pos_min = position_changes.min(axis=0)
+                pos_max = position_changes.max(axis=0)
+                pos_range = pos_max - pos_min
+                pos_range[pos_range == 0] = 1  # Avoid division by zero
+                pos_normalized = (position_changes - pos_min) / pos_range
+            
+            # Create RGB colors for each point (x->R, y->G, z->B)
+            colors_pos = pos_normalized  # [N, 3] where each row is [R, G, B]
+            
+            # Plot position changes with RGB colors
+            for i in range(len(position_changes)):
+                ax1.plot(steps[i], position_changes[i, 0], 'o', color=colors_pos[i], markersize=8, alpha=0.7, label='x' if i == 0 else '')
+                ax1.plot(steps[i], position_changes[i, 1], 's', color=colors_pos[i], markersize=8, alpha=0.7, label='y' if i == 0 else '')
+                ax1.plot(steps[i], position_changes[i, 2], '^', color=colors_pos[i], markersize=8, alpha=0.7, label='z' if i == 0 else '')
+            
+            # Also plot lines for better visualization
+            ax1.plot(steps, position_changes[:, 0], 'r-', alpha=0.3, linewidth=1, label='x (line)')
+            ax1.plot(steps, position_changes[:, 1], 'g-', alpha=0.3, linewidth=1, label='y (line)')
+            ax1.plot(steps, position_changes[:, 2], 'b-', alpha=0.3, linewidth=1, label='z (line)')
+            
+            ax1.set_xlabel('Step', fontsize=12)
+            ax1.set_ylabel('Position Change (m)', fontsize=12)
+            ax1.set_title('Position Changes Relative to Initial T_mc\n(Color: RGB = XYZ normalized)', fontsize=14)
+            ax1.legend(loc='best')
+            ax1.grid(True, alpha=0.3)
+            
+            # Subplot 2: Orientation changes (roll, pitch, yaw)
+            # Normalize euler changes to [0, 1] for RGB color mapping
+            euler_normalized = euler_changes.copy()
+            if len(euler_changes) > 0:
+                euler_min = euler_changes.min(axis=0)
+                euler_max = euler_changes.max(axis=0)
+                euler_range = euler_max - euler_min
+                euler_range[euler_range == 0] = 1  # Avoid division by zero
+                euler_normalized = (euler_changes - euler_min) / euler_range
+            
+            # Create RGB colors for each point (roll->R, pitch->G, yaw->B)
+            colors_euler = euler_normalized  # [N, 3] where each row is [R, G, B]
+            
+            # Plot orientation changes with RGB colors
+            for i in range(len(euler_changes)):
+                ax2.plot(steps[i], euler_changes[i, 0], 'o', color=colors_euler[i], markersize=8, alpha=0.7, label='roll' if i == 0 else '')
+                ax2.plot(steps[i], euler_changes[i, 1], 's', color=colors_euler[i], markersize=8, alpha=0.7, label='pitch' if i == 0 else '')
+                ax2.plot(steps[i], euler_changes[i, 2], '^', color=colors_euler[i], markersize=8, alpha=0.7, label='yaw' if i == 0 else '')
+            
+            # Also plot lines for better visualization
+            ax2.plot(steps, euler_changes[:, 0], 'r-', alpha=0.3, linewidth=1, label='roll (line)')
+            ax2.plot(steps, euler_changes[:, 1], 'g-', alpha=0.3, linewidth=1, label='pitch (line)')
+            ax2.plot(steps, euler_changes[:, 2], 'b-', alpha=0.3, linewidth=1, label='yaw (line)')
+            
+            ax2.set_xlabel('Step', fontsize=12)
+            ax2.set_ylabel('Orientation Change (rad)', fontsize=12)
+            ax2.set_title('Orientation Changes Relative to Initial T_mc (Euler XYZ)\n(Color: RGB = Roll/Pitch/Yaw normalized)', fontsize=14)
+            ax2.legend(loc='best')
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Save figure to output_dir
+            fig_path = os.path.join(output_dir, "T_mc_variation_analysis.png")
+            plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+            print(f"Saved T_mc variation analysis plot to {fig_path}")
+            
+            # Print statistics
+            print(f"\nT_mc Variation Statistics:")
+            print(f"  Number of T_mc_current collected: {len(T_mc_current_list)}")
+            print(f"  Position changes (m):")
+            print(f"    X: min={position_changes[:, 0].min():.6f}, max={position_changes[:, 0].max():.6f}, std={position_changes[:, 0].std():.6f}")
+            print(f"    Y: min={position_changes[:, 1].min():.6f}, max={position_changes[:, 1].max():.6f}, std={position_changes[:, 1].std():.6f}")
+            print(f"    Z: min={position_changes[:, 2].min():.6f}, max={position_changes[:, 2].max():.6f}, std={position_changes[:, 2].std():.6f}")
+            print(f"  Orientation changes (rad):")
+            print(f"    Roll:  min={euler_changes[:, 0].min():.6f}, max={euler_changes[:, 0].max():.6f}, std={euler_changes[:, 0].std():.6f}")
+            print(f"    Pitch: min={euler_changes[:, 1].min():.6f}, max={euler_changes[:, 1].max():.6f}, std={euler_changes[:, 1].std():.6f}")
+            print(f"    Yaw:   min={euler_changes[:, 2].min():.6f}, max={euler_changes[:, 2].max():.6f}, std={euler_changes[:, 2].std():.6f}")
+            
+            plt.close()
+        
         print()
         print("\nNon-blocking square movement with sequence handling completed successfully!")
         
@@ -1663,18 +1913,12 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
-        # Clean up
-        print("Closing environment...")
-        env.close()
-        print("Environment closed.")
+        # Clean up resources (this will also be called by signal handlers and atexit)
+        cleanup_resources()
         
-        # Clean up camera
-        if 'pipeline' in locals() and pipeline is not None:
-            try:
-                pipeline.stop()
-                print("RealSense camera pipeline stopped.")
-            except Exception as e:
-                print(f"Error stopping camera pipeline: {e}")
+        # Clear global variables to prevent double cleanup
+        _cleanup_env = None
+        _cleanup_pipeline = None
 
 
 if __name__ == "__main__":    
