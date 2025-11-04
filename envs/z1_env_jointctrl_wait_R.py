@@ -393,7 +393,8 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         self.has_previous_directions = False
         # Store previous iteration's chosen target joint positions (for IK fallback comparison)
         self.prev_target_joint_pos = None
-        self.prev_final_error = None
+        self.prev_final_error_pos = None
+        self.prev_final_error_ori = None
         self.prev_null_obj_val = None
         
         # Non-blocking inference system using multiprocessing
@@ -479,7 +480,8 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         # Reset previous directions flag for first step calculation
         self.has_previous_directions = False
         self.prev_target_joint_pos = None
-        self.prev_final_error = None
+        self.prev_final_error_pos = None
+        self.prev_final_error_ori = None
         self.prev_null_obj_val = None
         
         # Create step thread once during reset for reuse
@@ -839,6 +841,300 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         
         return success, q, iter_taken, final_error, null_obj_val
 
+
+    # jacobian ver
+    # 간단한 유틸: 현재 오차/코스트 계산
+    def pose_errors_and_cost(self, q_vec, target_T, w_pos, w_ori):
+        T = self._get_current_ee_se3(joint_pos=q_vec)
+        p = T[:3, 3]
+        R_cur = T[:3, :3]
+        p_d = target_T[:3, 3]
+        R_d = target_T[:3, :3]
+
+        # 위치/자세 오차
+        e_p = p_d - p
+        # 공간 프레임 오차: e_o = Log(R_d R^T)^\vee
+        R_e = R_d @ R_cur.T
+        e_o = R.from_matrix(R_e).as_rotvec()
+
+        # SO3Constraint와 동일 척도(작을수록 좋음)
+        null_obj_val = 0.5 * (3.0 - np.trace(R_cur @ R_d.T))
+
+        # 6D 오차 벡터와 가중 코스트
+        e6 = np.concatenate([w_pos * e_p, w_ori * e_o])
+        cost = 0.5 * (e6 @ e6)
+        return e_p, e_o, null_obj_val, cost
+
+    # 적응 감쇠 계산(특이값/조작도 기반)
+    def compute_lambda(self, J, lambda0, use_adaptive_damping, damp_gain):
+        lam = lambda0
+        if use_adaptive_damping:
+            # 특이값 기반(최소 특이값이 작으면 감쇠 증가)
+            s = np.linalg.svd(J, compute_uv=False)
+            s_min = float(np.min(s)) if s.size > 0 else 0.0
+            lam = lambda0 + damp_gain / (s_min + 1e-6)
+        return lam
+
+    def solve_ik_6d_qp(
+        self,
+        target_T: np.ndarray,
+        initial_guess: Optional[np.ndarray] = None,
+        max_iterations: int = 80,
+        tolerance_pos: float = 1e-2,
+        tolerance_ori: float = 2e-2,
+        Kp: float = 3.0,          # 위치 게인 [1/s]
+        Ko: float = 3.0,          # 자세 게인 [1/s]
+        sat_w: float = 2.0,       # 각속도 포화 [rad/s]
+        sat_v: float = 0.5,       # 선속도 포화 [m/s]
+        dq_inf_cap: float = 0.25  # per-iter |dq|_inf 제한(라디안)
+    ):
+        """
+        Unitree arm_model.solveQP를 이용한 6D 해결율 IK.
+        반환형: (success, q, iter_taken, final_error_pos, null_obj_val)
+        """
+        assert target_T.shape == (4, 4)
+        q = (self.current_joint_pos.copy() if initial_guess is None else initial_guess.copy())
+
+        dt_qp = float(getattr(self.arm._ctrlComp, "dt", 0.002))  # SDK 내부 dt 사용 권장
+
+        def errors(q_vec):
+            T = self._get_current_ee_se3(joint_pos=q_vec)
+            p, R_cur = T[:3, 3], T[:3, :3]
+            p_d, R_d = target_T[:3, 3], target_T[:3, :3]
+            e_p = p_d - p
+            R_e = R_d @ R_cur.T                 # space 기준
+            e_o = R.from_matrix(R_e).as_rotvec()
+            null_val = 0.5 * (3.0 - np.trace(R_cur @ R_d.T))
+            return e_p, e_o, null_val
+
+        e_p, e_o, null_obj_val = errors(q)
+        it = 0
+        success = False
+
+        while it < max_iterations:
+            if (np.linalg.norm(e_p) < tolerance_pos) and (np.linalg.norm(e_o) < tolerance_ori):
+                success = True
+                break
+
+            # 원하는 트위스트 ( [ω; v] 순서 ) + 포화
+            Vdes = np.concatenate([Ko * e_o, Kp * e_p]).astype(float)
+            Vdes[:3] = np.clip(Vdes[:3], -sat_w, sat_w)
+            Vdes[3:] = np.clip(Vdes[3:], -sat_v, sat_v)
+
+            # QP로 qd 풀기 (SDK 시그니처: solveQP(twist, q_near, dt))
+            try:
+                qd = np.array(self.arm_model.solveQP(Vdes, q, dt_qp), dtype=float).reshape(6)
+            except Exception:
+                # 혹시 실패 시 최소자승 대체 (매우 드뭄)
+                J = np.asarray(self.arm_model.CalcJacobian(q)).reshape(6, 6).astype(float)
+                qd = np.linalg.lstsq(J, Vdes, rcond=None)[0]
+                print('######## Least QP fails. Least squares solution used instead.')
+
+            # 스텝 적용
+            dq = qd * dt_qp
+
+            # per-iter |dq|_inf 제한(너무 큰 스텝 방지)
+            infn = np.linalg.norm(dq, ord=np.inf)
+            if infn > dq_inf_cap:
+                dq *= (dq_inf_cap / (infn + 1e-12))
+
+            q = q + dq
+
+            # 안전망 클립(대부분 필요 없음; QP가 제약 처리)
+            q = np.clip(
+                q,
+                np.array([lim[0] for lim in self.joint_limits]),
+                np.array([lim[1] for lim in self.joint_limits]),
+            )
+
+            e_p, e_o, null_obj_val = errors(q)
+            it += 1
+
+        final_error_pos = float(np.linalg.norm(e_p))
+        return success, q, it, final_error_pos, float(null_obj_val)
+
+    def solve_ik_6d_dls_jacobian(
+        self,
+        target_T: np.ndarray,
+        initial_guess: Optional[np.ndarray] = None,
+        max_iterations: int = 50,
+        tolerance_pos: float = 1e-2,     # 위치 수렴 허용 (m)
+        tolerance_ori: float = 2e-2,     # 자세 수렴 허용 (rad; 회전벡터 노름)
+        w_pos: float = 1.0,              # 위치 가중
+        w_ori: float = 1.0,              # 자세 가중
+        lambda0: float = 1e-3,           # 기본 감쇠
+        use_adaptive_damping: bool = True,
+        damp_gain: float = 1e-2,         # 적응 감쇠 이득
+        alpha_init: float = 1.0,         # 초기 라인서치 스텝
+        joint_clip: bool = True
+    ):
+        """
+        Solve IK using 6D Damped Least Squares with the robot's spatial Jacobian.
+
+        Args mirror solve_ik_null_space as much as possible. Returns:
+            tuple: (success, q, iter_taken, final_error_pos, null_obj_val)
+                - success: both position & orientation tolerances satisfied
+                - q: solved joint angles
+                - iter_taken: iterations used
+                - final_error_pos: ||p_d - p(q)||
+                - null_obj_val: 0.5*(3 - trace(R_current * R_des^T))  (SO3Constraint와 동일 척도)
+        """
+        assert target_T.shape == (4, 4), "target_T must be 4x4 SE(3) matrix"
+
+        # 초기 q 설정
+        if initial_guess is None:
+            q = self.current_joint_pos.copy()
+        else:
+            q = initial_guess.copy()
+
+        # 가중 행렬 W (6x6, 위치/자세 분리 가중)
+        W = np.diag([w_pos, w_pos, w_pos, w_ori, w_ori, w_ori]).astype(float)
+
+        
+
+        
+
+        iter_taken = 0
+        success = False
+
+        # 초기 에러/코스트
+        e_p, e_o, null_obj_val, cost = self.pose_errors_and_cost(q, target_T, w_pos, w_ori)
+
+        while iter_taken < max_iterations:
+            # 수렴 체크
+            if (np.linalg.norm(e_p) < tolerance_pos) and (np.linalg.norm(e_o) < tolerance_ori):
+                success = True
+                break
+
+            # 6x6 공간 야코비안
+            J = np.asarray(self.arm_model.CalcJacobian(q)).reshape(6, 6).astype(float)
+
+            # 6D 오차 벡터 (가중은 정규방정식에서 W로 처리해도 되지만,
+            # 여기서는 정규방정식에 W를 명시적으로 넣음)
+            # e6 = np.concatenate([e_p, e_o])
+            
+            # 방법 A: e6/W 순서를 J에 맞춰 바꿈
+            e6 = np.concatenate([e_o, e_p])  # 각속도 먼저
+            W  = np.diag([w_ori, w_ori, w_ori, w_pos, w_pos, w_pos])
+
+            # DLS 정규방정식
+            lam = self.compute_lambda(J, lambda0, use_adaptive_damping, damp_gain)
+            
+            
+            
+            # A = J.T @ W @ J + (lam ** 2) * np.eye(6)
+            # b = J.T @ W @ e6
+
+            # try:
+            #     dq = np.linalg.solve(A, b)
+            # except np.linalg.LinAlgError:
+            #     # 드물게 A가 수치적으로 불량하면 안정적 대안
+            #     dq = np.linalg.lstsq(A, b, rcond=None)[0]
+
+            
+
+
+
+            # 2) 액티브-셋 DLS로 dq 구하기
+            dq = self._dls_step_with_active_set(
+                J, e6, W, lam, q,
+                np.array([l[0] for l in self.joint_limits]),
+                np.array([l[1] for l in self.joint_limits]),
+                margin=0.03  # 0.02~0.05 rad 권장
+            )
+
+            # 3) 라인서치 + (필요시) dq 크기 제한
+            dq_norm = np.linalg.norm(dq, ord=np.inf)
+            if dq_norm > 0.2:   # per-iter step cap (예시)
+                dq *= (0.2 / dq_norm + 1e-12)
+
+
+
+
+            # 간단한 백트래킹 라인서치(발산 방지)
+            alpha = alpha_init
+            q_candidate = q + alpha * dq
+
+            if joint_clip:
+                q_candidate = np.clip(
+                    q_candidate,
+                    [lim[0] for lim in self.joint_limits],
+                    [lim[1] for lim in self.joint_limits],
+                )
+
+            # _, _, _, cost_new = self.pose_errors_and_cost(q_candidate, target_T, w_pos, w_ori)
+
+            # # 개선되지 않으면 스텝 줄이기(최대 3회)
+            # backtrack = 0
+            # while cost_new > cost and backtrack < 3:
+            #     alpha *= 0.5
+            #     q_candidate = q + alpha * dq
+            #     if joint_clip:
+            #         q_candidate = np.clip(
+            #             q_candidate,
+            #             [lim[0] for lim in self.joint_limits],
+            #             [lim[1] for lim in self.joint_limits],
+            #         )
+            #     _, _, _, cost_new = self.pose_errors_and_cost(q_candidate, target_T, w_pos, w_ori)
+            #     backtrack += 1
+
+            # 스텝 적용
+            q = q_candidate
+            e_p, e_o, null_obj_val, cost = self.pose_errors_and_cost(q, target_T, w_pos, w_ori)
+            iter_taken += 1
+
+        # 최종 에러 메트릭
+        final_error_pos = np.linalg.norm(e_p)
+        final_error_ori = np.linalg.norm(e_o)
+
+        return success, q, iter_taken, final_error_pos, final_error_ori, float(null_obj_val)
+
+    def _dls_step_with_active_set(self, J, e6, W, lam, q, qmin, qmax, margin=0.02):
+        """
+        박스 제약(조인트 한계)을 고려한 한 스텝 DLS.
+        - 한계 근처(margin)에서 그 한계 쪽으로 더 가려는 관절은 '잠금' 처리(Δq_i=0)
+        - '잠금' 관절은 J의 해당 열을 제외하고 남은 자유도로 최소자승을 다시 풉니다.
+        """
+        n = 6
+        free = np.ones(n, dtype=bool)
+        # 한계에 바짝 붙어있는 관절은 먼저 후보로 체크
+        near_low  = (q - qmin) < margin
+        near_high = (qmax - q) < margin
+
+        for _ in range(n):  # 최악의 경우 관절 6개 모두 잠글 수 있으니 n회 이내 종료
+            Jf = J[:, free]
+            Af = Jf.T @ W @ Jf + (lam**2) * np.eye(np.sum(free))
+            bf = Jf.T @ W @ e6
+
+            try:
+                dqf = np.linalg.solve(Af, bf)
+            except np.linalg.LinAlgError:
+                dqf = np.linalg.lstsq(Af, bf, rcond=None)[0]
+
+            dq = np.zeros(n)
+            dq[free] = dqf
+
+            q_try = q + dq
+
+            # 한계 침범을 유발하는 관절을 잠금 후보로
+            lock_low  = (q_try < qmin) & (dq < 0)
+            lock_high = (q_try > qmax) & (dq > 0)
+            # 또는 한계에 가까운데 그쪽으로 더 가려는 경우
+            lock_low  |= near_low  & (dq < 0)
+            lock_high |= near_high & (dq > 0)
+
+            lock = (lock_low | lock_high) & free
+            if not np.any(lock):
+                return dq  # 제약 위반 없으면 스텝 확정
+
+            # 잠금 적용하고 다시 풉니다
+            free[lock] = False
+
+        # 모든 관절을 잠갔다면 0 스텝
+        return np.zeros(n)
+
+
+
     def _get_current_ee_orientation(self) -> np.ndarray:
         """Get current end-effector orientation as quaternion in [x,y,z,w] format."""
         T = self.arm_model.forwardKinematics(self.current_joint_pos, 6)
@@ -925,41 +1221,75 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         # Use inverse kinematics to get target joint positions
         # Try to solve IK for target pose using solve_ik_null_space
         
-        success, target_joint_pos, iterations, final_error, null_obj_val = self.solve_ik_null_space(
+        # # NOTE: validated for simple trajectory tracking
+        # success, target_joint_pos, iterations, final_error_pos, null_obj_val = self.solve_ik_null_space(
+        #     target_T, 
+        #     initial_guess=current_joint_pos,
+        #     max_iterations=50,
+        #     tolerance=1e-2,
+        #     tolerance_null=1e-3
+        # )
+        # final_error_ori = 0.0 # temporary value for debug
+        
+        # NOTE: validated for simple trajectory tracking
+        success, target_joint_pos, iterations, final_error_pos, final_error_ori, null_obj_val = self.solve_ik_6d_dls_jacobian(
             target_T, 
             initial_guess=current_joint_pos,
-            max_iterations=20,
-            tolerance=1e-2,
-            tolerance_null=1e-3
+            max_iterations=50,
+            tolerance_pos=1e-2,
+            tolerance_ori=2e-2,
+            w_pos=1.0,
+            w_ori=0.1,
+            lambda0=1e-3,
+            use_adaptive_damping=True,
+            damp_gain=1e-2,
+            alpha_init=1.0,
+            joint_clip=True,
         )
+        
+        # NOTE: currently doesn't work for very simple trajectory tracking
+        # success, target_joint_pos, iterations, final_error_pos, null_obj_val = self.solve_ik_6d_qp(
+        #     target_T, 
+        #     initial_guess=current_joint_pos,
+        #     max_iterations=50,
+        #     tolerance_pos=1e-2,
+        #     tolerance_ori=2e-2,
+        #     Kp=3.0,
+        #     Ko=3.0,
+        # )
+        # final_error_ori = 0.0 # temporary value for debug
+        
+
         if not success:
-            print(f"Warning: IK failed to converge (error: {final_error:.6f}, null_obj: {null_obj_val:.6f})")
+            print(f"Warning: IK failed to converge (error_pos: {final_error_pos:.6f}, error_ori: {final_error_ori:.6f}, null_obj: {null_obj_val:.6f})")
             if self.use_current_joint_pos_when_ik_fails:
                 target_joint_pos = current_joint_pos.copy()
                 # Do not update prev metrics here since we didn't select a solver-produced q
             else:
                 # Compare using previous stored (final_error, null_obj_val) vs current iteration's
                 use_prev = False
-                if self.prev_final_error is not None and self.prev_null_obj_val is not None and self.prev_target_joint_pos is not None:
-                    # Lexicographic comparison: prioritize final_error, then null_obj_val
-                    prev_pair = (self.prev_final_error, self.prev_null_obj_val)
-                    curr_pair = (final_error, null_obj_val)
-                    if (prev_pair[0] < curr_pair[0]) or (np.isclose(prev_pair[0], curr_pair[0]) and prev_pair[1] < curr_pair[1]):
-                        use_prev = True
+                # if self.prev_final_error is not None and self.prev_null_obj_val is not None and self.prev_target_joint_pos is not None:
+                #     # Lexicographic comparison: prioritize final_error, then null_obj_val
+                #     prev_pair = (self.prev_final_error, self.prev_null_obj_val)
+                #     curr_pair = (final_error, null_obj_val)
+                #     if (prev_pair[0] < curr_pair[0]) or (np.isclose(prev_pair[0], curr_pair[0]) and prev_pair[1] < curr_pair[1]):
+                #         use_prev = True
                 # Select the q with smaller error metrics
                 if use_prev:
-                    print(f"IK fallback: using prev q (prev_err={self.prev_final_error:.6f}, prev_null={self.prev_null_obj_val:.6f}) vs curr_err={final_error:.6f}, curr_null={null_obj_val:.6f}")
+                    print(f"IK fallback: using prev q (prev_err_pos={self.prev_final_error_pos:.6f}, prev_err_ori={self.prev_final_error_ori:.6f}, prev_null={self.prev_null_obj_val:.6f}) vs curr_err_pos={final_error_pos:.6f}, curr_err_ori={final_error_ori:.6f}, curr_null={null_obj_val:.6f}")
                     target_joint_pos = self.prev_target_joint_pos.copy()
                     # Keep previous metrics as they correspond to chosen q
                 else:
-                    print(f"IK fallback: using current q from solver (curr_err={final_error:.6f}, curr_null={null_obj_val:.6f})")
+                    print(f"IK fallback: using current q from solver (curr_err_pos={final_error_pos:.6f}, curr_err_ori={final_error_ori:.6f}, curr_null={null_obj_val:.6f})")
                     # Update previous metrics to current since we chose current q
-                    self.prev_final_error = final_error
+                    self.prev_final_error_pos = final_error_pos
+                    self.prev_final_error_ori = final_error_ori
                     self.prev_null_obj_val = null_obj_val
         else:
-            print(f"IK solved successfully in {iterations} iterations (error: {final_error:.6f}, null_obj: {null_obj_val:.6f})")
+            print(f"IK solved successfully in {iterations} iterations (error: {final_error_pos:.6f}, error_ori: {final_error_ori:.6f}, null_obj: {null_obj_val:.6f})")
             # On success, update previous metrics to current
-            self.prev_final_error = final_error
+            self.prev_final_error_pos = final_error_pos
+            self.prev_final_error_ori = final_error_ori
             self.prev_null_obj_val = null_obj_val
         # Remember chosen target q for next iteration's comparison
         self.prev_target_joint_pos = target_joint_pos.copy()

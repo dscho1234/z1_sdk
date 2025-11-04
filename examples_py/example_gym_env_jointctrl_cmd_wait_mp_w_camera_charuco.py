@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Example usage of the Z1 Gym environment with end-effector pose control using cartesian commands
+Example usage of the Z1 Gym environment with end-effector pose control using joint commands
 and non-blocking step execution.
 
-This example demonstrates how to use the EEPoseCtrlCartesianCmdWrapper with the new
-wait argument to control the Z1 robot arm's end-effector pose using non-blocking step execution.
+This example demonstrates how to use the EEPoseCtrlJointCmdWrapper with the new
+wait argument to control the Z1 robot arm's end-effector pose using jointCtrlCmd.
 """
 
 import sys
@@ -19,10 +19,11 @@ from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 import signal
 import atexit
+from scipy.ndimage import gaussian_filter1d
 
 # Add the envs directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "envs"))
-from envs.z1_env_rtc_wait_mp import EEPoseCtrlCartesianCmdWrapper
+from envs.z1_env_jointctrl_wait_R import EEPoseCtrlJointCmdWrapper
 
 # # custom (hand-made), 3x5 charuco reference marker: 1
 # T_B_M = np.array([[0.00000000, 0.00000000, 1.00000000, 0.76401688],
@@ -222,10 +223,10 @@ def make_detector_params():
     p.cornerRefinementMaxIterations = 30
     p.cornerRefinementMinAccuracy = 0.01
     
-    # 추가 검출 파라미터
-    p.adaptiveThreshWinSizeMin = 3
-    p.adaptiveThreshWinSizeMax = 23
-    p.adaptiveThreshWinSizeStep = 10
+    # # 추가 검출 파라미터
+    # p.adaptiveThreshWinSizeMin = 3
+    # p.adaptiveThreshWinSizeMax = 23
+    # p.adaptiveThreshWinSizeStep = 10
     
     return p
 
@@ -983,6 +984,27 @@ def backproject_pixel(K, u, v, depth, dist_coeffs=None):
     y = (v_undist - cy) * z / fy
     return np.array([x, y, z])
 
+def apply_temporal_smoothing(data, sigma=1.0):
+    """
+    Apply temporal smoothing to trajectory data using Gaussian filter
+    
+    Args:
+        data: numpy array of shape (T, 3) for translation or (T, 3) for Euler angles
+        sigma: standard deviation for Gaussian filter (higher = more smoothing)
+    
+    Returns:
+        smoothed_data: numpy array of same shape as input
+    """
+    if len(data.shape) == 2:
+        # Apply smoothing to each component separately
+        smoothed_data = np.zeros_like(data)
+        for i in range(data.shape[1]):
+            smoothed_data[:, i] = gaussian_filter1d(data[:, i], sigma=sigma)
+        return smoothed_data
+    else:
+        # For 1D data
+        return gaussian_filter1d(data, sigma=sigma)
+
 def get_dift_point_base_frame_data_for_debug(camera_matrix=None, dist_coeffs=None, droid=False):
     import zarr
     from im2flow2act.common.utility.zarr import parallel_reading
@@ -1085,13 +1107,16 @@ def get_estimated_hand_pose_base_frame_data_for_debug(droid=False):
     
     # use first obs
     R_cg_opt = data_dict['R_cg_opt_trajectory'][:] # [T, 3, 3]
+    R_cg_opt_depth = data_dict['R_cg_opt_depth_trajectory'][:] # [T, 3, 3]
     t_cg_opt_depth = data_dict['t_cg_opt_depth_trajectory'][:] # [T, 3]
     t_cg_opt = data_dict['t_cg_opt_trajectory'][:] # [T, 3]
     t_cg_closed = data_dict['t_cg_closed_trajectory'][:] # [T, 3]
     euler_cg_opt = R.from_matrix(R_cg_opt).as_euler('xyz') # [T, 3]
+    euler_cg_opt_depth = R.from_matrix(R_cg_opt_depth).as_euler('xyz') # [T, 3]
     temp_gripper = np.tile(np.array([0.0]), (euler_cg_opt.shape[0], 1)) # [T, 1]
     # dscho NOTE: depth-based one is much smoother when using accurate T_B_M. accuracy is slightly better.
-    proprioception = np.concatenate([t_cg_opt_depth, euler_cg_opt, temp_gripper], axis=-1) # [T, 7]
+    # proprioception = np.concatenate([t_cg_opt_depth, euler_cg_opt, temp_gripper], axis=-1) # [T, 7]
+    # proprioception = np.concatenate([t_cg_opt_depth, euler_cg_opt_depth, temp_gripper], axis=-1) # [T, 7]
     # proprioception = np.concatenate([t_cg_opt, euler_cg_opt, temp_gripper], axis=-1) # [T, 7]
     # proprioception = np.concatenate([t_cg_closed, euler_cg_opt, temp_gripper], axis=-1) # [T, 7]
 
@@ -1100,7 +1125,10 @@ def get_estimated_hand_pose_base_frame_data_for_debug(droid=False):
     # print("@@@@@@@@@@@@@@@@@@@@@@@@@ apply scaling to the proprioception for debugging")
     # time.sleep(2)
 
-
+    smoothing_sigma = 2.0
+    t_cg_opt_depth_smooth = apply_temporal_smoothing(t_cg_opt_depth, smoothing_sigma)
+    euler_cg_opt_depth_smooth = apply_temporal_smoothing(euler_cg_opt_depth, smoothing_sigma)
+    proprioception = np.concatenate([t_cg_opt_depth_smooth, euler_cg_opt_depth_smooth, temp_gripper], axis=-1) # [T, 7]
     
     
     # assert proprioception.shape[0] == T_mc_transformation.shape[0]
@@ -1233,14 +1261,14 @@ def main():
     sequence_length = 16   # Length of future target pose sequences
     step_interval = 1.0 / control_frequency  # Time between steps in seconds
     
-    env = EEPoseCtrlCartesianCmdWrapper(
+    env = EEPoseCtrlJointCmdWrapper(
         has_gripper=True,
         control_frequency=control_frequency,  # 5Hz control frequency
         position_tolerance=0.01,
         orientation_tolerance=0.1,
-        angular_vel=1.0,  # Angular velocity limit
-        linear_vel=0.3,   # Linear velocity limit
+        joint_speed=0.5,  # Joint speed limit
         sequence_length=sequence_length,  # Length of future sequences
+        use_current_joint_pos_when_ik_fails = False,
         
     )
     
@@ -1275,8 +1303,7 @@ def main():
         print("Orientation will change roll: 0°, +90°, 0°, -90°, 0° for each edge")
         print(f"Control frequency: {control_frequency} Hz")
         print(f"Step interval: {step_interval:.3f}s")
-        print(f"Angular velocity limit: {env.angular_vel} rad/s")
-        print(f"Linear velocity limit: {env.linear_vel} m/s")
+        print(f"Joint speed limit: {env.joint_speed} rad/s")
         print(f"Sequence length: {sequence_length}")
         print()
         
@@ -1311,35 +1338,35 @@ def main():
             dist_coeffs = None
 
         # dscho debug to specify the position and orientation
-        original_position = np.array([0.41145274, -0.00121779, 0.40713578])
+        # original_position = np.array([0.41145274, -0.00121779, 0.40713578])
         # current_orientation_wxyz = np.array([0.9998209, -0.0011671, -0.01868073, -0.00280654])  # [w,x,y,z]
         current_orientation_wxyz = np.array([1.0, 0.0, 0.0, 0.0])  # [w,x,y,z]
         current_orientation = np.array([current_orientation_wxyz[1], current_orientation_wxyz[2], 
                                        current_orientation_wxyz[3], current_orientation_wxyz[0]])  # [x,y,z,w]
 
         # Define square vertices in YZ plane (0.1m x 0.1m square)
-        square_size = 0.2  # 0.1m
-        # square_vertices = [
-        #     original_position + np.array([0.0, 0.0, 0.0]),           # Start point
-        #     original_position + np.array([0.0, square_size, 0.0]),   # Y+0.1
-        #     original_position + np.array([0.0, square_size, square_size]),  # Y+0.1, Z+0.1
-        #     original_position + np.array([0.0, 0.0, square_size]),   # Z+0.1
-        #     original_position + np.array([0.0, 0.0, 0.0])            # Back to start
-        # ]
-        
+        square_size = 0.1  # 0.1m
         square_vertices = [
             original_position + np.array([0.0, 0.0, 0.0]),           # Start point
-            original_position + np.array([0.0, 0.0, -square_size]),   # Z-0.1
-            original_position + np.array([0.0, square_size, -square_size]),  # Y+0.1, Z-0.1
             original_position + np.array([0.0, square_size, 0.0]),   # Y+0.1
+            original_position + np.array([0.0, square_size, square_size]),  # Y+0.1, Z+0.1
+            original_position + np.array([0.0, 0.0, square_size]),   # Z+0.1
             original_position + np.array([0.0, 0.0, 0.0])            # Back to start
         ]
+        
+        # square_vertices = [
+        #     original_position + np.array([0.0, 0.0, 0.0]),           # Start point
+        #     original_position + np.array([0.0, 0.0, -square_size]),   # Z-0.1
+        #     original_position + np.array([0.0, square_size, -square_size]),  # Y+0.1, Z-0.1
+        #     original_position + np.array([0.0, square_size, 0.0]),   # Y+0.1
+        #     original_position + np.array([0.0, 0.0, 0.0])            # Back to start
+        # ]
 
         # D435 depth-based dift point (leftside bottle cap): array([0.592886  , 0.24988669, 0.1399751 ]), (on the socket): array([ 0.58816114, -0.0290327 , -0.00381193]), 
         # unidepth-based dift point (leftside bottle cap): array([0.62878956, 0.22977131, 0.13334631]), (on the socket): array([0.52487209, 0.02690133, 0.01839266]), 
         # NOTE
         dift_point_base_frame, dift_point_marker_frame, dift_point_camera_frame, point_in_front_of_the_marker_base_frame, dift_points_custom_unprojected_c, dift_points_custom_unprojected_b = get_dift_point_base_frame_data_for_debug(camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, droid=droid) # [T, N, 3]
-        # DEBUG_POINT = dift_point_base_frame[0,1] + np.array([0.0, 0.0, 0.1])
+        # DEBUG_POINT = dift_point_base_frame[0,1] # + np.array([0.0, 0.0, 0.1])
         # DEBUG_POINT = point_in_front_of_the_marker_base_frame
 
         proprioception_base_frame, proprioception_quat_base_frame, proprioception_camera_frame = get_estimated_hand_pose_base_frame_data_for_debug(droid=droid) # [T, 7]
@@ -1351,11 +1378,11 @@ def main():
         # print('@@@@@@@@@@@@@@@@@@@@@@@@@ Currently using DEBUG_ACTION :', DEBUG_ACTION)
 
         
-        DEBUG_ROLL_ANGLES = [0, 0, 0, 0, 0]
+        # DEBUG_ROLL_ANGLES = [0, 0, 0, 0, 0]
         # Define orientation vertices with roll changes: 0°, +90°, 0°, -90°, 0°
-        # roll_angles = [0, np.pi/4, 0, -np.pi/4, 0]  # 0°, +90°, 0°, -90°, 0°
+        roll_angles = [0, np.pi/2, 0, -np.pi/2, 0]  # 0°, +90°, 0°, -90°, 0°
         
-        roll_angles = DEBUG_ROLL_ANGLES
+        # roll_angles = DEBUG_ROLL_ANGLES
         orientation_vertices = []
         
         for roll_angle in roll_angles:
@@ -1372,7 +1399,7 @@ def main():
         print()
 
         
-        total_steps = 150 #  10 # proprioception_base_frame.shape[0] # 100
+        total_steps = 190 # 150 #  10 # proprioception_base_frame.shape[0] # 100
         inference_time = 0.15  # Inference time in seconds
         
         print(f"Running non-blocking control with overlapped inference for {total_steps} steps")
@@ -1411,21 +1438,25 @@ def main():
         print("Detecting ChArUco Markers (Before Loop)")
         print("=" * 80)
         
-        # Capture initial RGB image for marker detection
-        rgb_init, depth_init, capture_success = capture_realsense_image(pipeline, align)
+
+        while True:
+            # Capture initial RGB image for marker detection
+            rgb_init, depth_init, capture_success = capture_realsense_image(pipeline, align)
+            
         
-    
-        print("Successfully captured initial RGB and depth images for marker detection")
+            print("Successfully captured initial RGB and depth images for marker detection")
+            
+            # 2) ChArUco 보드 검출 및 자세 추정
         
-        # 2) ChArUco 보드 검출 및 자세 추정
-    
-        # Convert to grayscale for ChArUco detection
-        gray_init = cv2.cvtColor(rgb_init, cv2.COLOR_BGR2GRAY)
-        
-        # Detect ChArUco board
-        board_success, charuco_corners, charuco_ids, marker_corners, marker_ids, rvec_board, tvec_board = detect_charuco_board(
-            gray_init, board, camera_matrix, dist_coeffs
-        )
+            # Convert to grayscale for ChArUco detection
+            gray_init = cv2.cvtColor(rgb_init, cv2.COLOR_BGR2GRAY)
+            
+            # Detect ChArUco board
+            board_success, charuco_corners, charuco_ids, marker_corners, marker_ids, rvec_board, tvec_board = detect_charuco_board(
+                gray_init, board, camera_matrix, dist_coeffs
+            )
+            if board_success:
+                break
         
         if board_success:
             print(f"Successfully detected ChArUco Board!")
@@ -1491,6 +1522,12 @@ def main():
         
         # Store T_mc_current transformations for analysis
         T_mc_current_list = []  # List of T_mc_current (4x4) matrices
+        
+        # Store action and actual robot pose for comparison plot
+        action_positions = []  # List of action positions [x, y, z]
+        action_orientations = []  # List of action quaternions [qx, qy, qz, qw]
+        actual_positions = []  # List of actual robot positions [x, y, z]
+        actual_orientations = []  # List of actual robot quaternions [qx, qy, qz, qw]
         
         # Sequence tracking variables
         current_action_sequence = None
@@ -1577,7 +1614,7 @@ def main():
             
 
             # DEBUG_POINT = point_in_front_of_the_marker_base_frame
-            # DEBUG_POINT = dift_point_base_frame[0,0] # + np.array([0.0, 0.0, 0.1])
+            DEBUG_POINT = dift_point_base_frame[0,0] # + np.array([0.0, 0.0, 0.1])
             # DEBUG_POINT = proprioception_base_frame[0, :3] # + np.array([0.0, 0.0, 0.1])
             # DEBUG_POINT = dift_points_custom_unprojected_b[0,1] + np.array([0.0, 0.0, 0.1]) # result is almost same as g.t
             
@@ -1585,14 +1622,16 @@ def main():
 
             # DEBUG_ACTION = np.concatenate([DEBUG_POINT, current_orientation, np.array([0.0])])
 
-            DEBUG_ACTION = np.concatenate([proprioception_quat_base_frame[step, :7].copy(), np.array([0.0])])
+            # DEBUG_ACTION = np.concatenate([original_position+np.array([0.0, 0.0, 0.0]), proprioception_quat_base_frame[step*2, 3:7].copy(), np.array([0.0])])
+            DEBUG_ACTION = np.concatenate([proprioception_quat_base_frame[step*2, :7].copy(), np.array([0.0])])
+            # DEBUG_ACTION = np.concatenate([proprioception_quat_base_frame[step, :3].copy(), current_orientation, np.array([0.0])])
 
             print(f'@@@@@@@@@@@@@@@@@@@@@@@@@ Step {step}: Using DEBUG_ACTION with camera_data (base frame): {DEBUG_ACTION[:3]}')
-
-            
             assert DEBUG_ACTION[-1] == 0.0, "assume camera is attached, so the gripper should not be moved"
-            # env.step(action, wait=False) # a_t
             env.step(DEBUG_ACTION, wait=False) # a_t
+            
+            # env.step(action, wait=False) # a_t
+            
 
             print(f"Step {step}: Started non-blocking execution in {time.time() - start:.6f}s")
             
@@ -1625,10 +1664,22 @@ def main():
             if result:
                 obs, reward, done, info = result # o_t+1, r_t, etc
                 print(f"Step {step}: Received o_{step+1}, time taken: {time.time() - start:.6f}s")
+                
+                # Store action and actual robot pose for comparison plot
+                # Action format: [x, y, z, qx, qy, qz, qw, gripper]
+                action_positions.append(DEBUG_ACTION[:3].copy())
+                action_orientations.append(DEBUG_ACTION[3:7].copy())
+                # action_positions.append(action[:3].copy())
+                # action_orientations.append(action[3:7].copy())
+                
+                # Actual pose format: [x, y, z, qx, qy, qz, qw] from current_ee_pose or obs
+                actual_ee_pose = info['current_ee_pose']
+                actual_positions.append(actual_ee_pose[:3].copy())
+                actual_orientations.append(actual_ee_pose[3:7].copy())
             else:
                 print(f"Step {step}: Warning - No result from background step")
                 # Use previous observation if no result
-                pass
+                continue  # Skip this step if no result
             
             # Print gripper state
             gripper_state = obs[19] if len(obs) > 19 else 0.0
@@ -1755,8 +1806,8 @@ def main():
         print(f"Final position: [{final_pos[0]:.3f}, {final_pos[1]:.3f}, {final_pos[2]:.3f}]")
         print(f"Final position error: {final_error:.4f}")
         print(f"Final FSM state: {info['fsm_state']}")
-        print(f"Final cartesian directions: {info['cartesian_directions']}")
-        print(f"Final speeds - Linear: {info['actual_linear_speed']:.3f}, Angular: {info['actual_angular_speed']:.3f}, Gripper: {info['gripper_speed']:.3f}")
+        print(f"Final joint directions: {info['joint_directions']}")
+        print(f"Final speeds - Joint: {info['actual_joint_speed']:.3f}, Gripper: {info['gripper_speed']:.3f}")
         print(f"DT ratio (actual_control_time/arm_dt): {info['dt_ratio']}")
         print(f"Final sequence index: {env.sequence_index}")
         print(f"Final sequence length: {len(env.current_sequence) if env.current_sequence is not None else 0}")
@@ -1913,6 +1964,107 @@ def main():
             print(f"    Roll:  min={euler_changes[:, 0].min():.6f}, max={euler_changes[:, 0].max():.6f}, std={euler_changes[:, 0].std():.6f}")
             print(f"    Pitch: min={euler_changes[:, 1].min():.6f}, max={euler_changes[:, 1].max():.6f}, std={euler_changes[:, 1].std():.6f}")
             print(f"    Yaw:   min={euler_changes[:, 2].min():.6f}, max={euler_changes[:, 2].max():.6f}, std={euler_changes[:, 2].std():.6f}")
+            
+            plt.close()
+        
+        # ========== Plot Action vs Actual Robot Pose Comparison ==========
+        if len(action_positions) > 0 and len(actual_positions) > 0:
+            print("\nCreating action vs actual robot pose comparison plot...")
+            
+            # Convert lists to numpy arrays
+            action_positions_array = np.array(action_positions)  # [N, 3]
+            action_orientations_array = np.array(action_orientations)  # [N, 4]
+            actual_positions_array = np.array(actual_positions)  # [N, 3]
+            actual_orientations_array = np.array(actual_orientations)  # [N, 4]
+            
+            # Convert quaternions to euler angles
+            action_euler_list = []
+            actual_euler_list = []
+            for i in range(len(action_orientations_array)):
+                # Action quaternion format: [qx, qy, qz, qw]
+                action_quat = action_orientations_array[i]
+                action_rot = R.from_quat(action_quat)  # scipy uses [x, y, z, w] format
+                action_euler = action_rot.as_euler('xyz')
+                action_euler_list.append(action_euler)
+                
+                # Actual quaternion format: [qx, qy, qz, qw]
+                actual_quat = actual_orientations_array[i]
+                actual_rot = R.from_quat(actual_quat)
+                actual_euler = actual_rot.as_euler('xyz')
+                actual_euler_list.append(actual_euler)
+            
+            action_euler_array = np.array(action_euler_list)  # [N, 3] (roll, pitch, yaw)
+            actual_euler_array = np.array(actual_euler_list)  # [N, 3] (roll, pitch, yaw)
+            
+            # Create figure with 2 subplots
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+            
+            # Subplot 1: Position comparison
+            steps = np.arange(len(action_positions_array))
+            
+            # Normalize positions to [0, 1] for RGB color mapping
+            pos_min = np.minimum(action_positions_array.min(axis=0), actual_positions_array.min(axis=0))
+            pos_max = np.maximum(action_positions_array.max(axis=0), actual_positions_array.max(axis=0))
+            pos_range = pos_max - pos_min
+            pos_range[pos_range == 0] = 1  # Avoid division by zero
+            
+            # Normalize action positions
+            action_pos_normalized = (action_positions_array - pos_min) / pos_range
+            # Normalize actual positions
+            actual_pos_normalized = (actual_positions_array - pos_min) / pos_range
+            
+            # Plot position comparison with RGB colors
+            # Action: solid lines
+            ax1.plot(steps, action_positions_array[:, 0], 'r-', linewidth=2, label='Action X', alpha=0.8)
+            ax1.plot(steps, action_positions_array[:, 1], 'g-', linewidth=2, label='Action Y', alpha=0.8)
+            ax1.plot(steps, action_positions_array[:, 2], 'b-', linewidth=2, label='Action Z', alpha=0.8)
+            
+            # Actual: dashed lines
+            ax1.plot(steps, actual_positions_array[:, 0], 'r--', linewidth=2, label='Actual X', alpha=0.8)
+            ax1.plot(steps, actual_positions_array[:, 1], 'g--', linewidth=2, label='Actual Y', alpha=0.8)
+            ax1.plot(steps, actual_positions_array[:, 2], 'b--', linewidth=2, label='Actual Z', alpha=0.8)
+            
+            ax1.set_xlabel('Step', fontsize=12)
+            ax1.set_ylabel('Position (m)', fontsize=12)
+            ax1.set_title('Action vs Actual Robot Position Comparison\n(Solid: Action, Dashed: Actual)', fontsize=14)
+            ax1.legend(loc='best', ncol=2)
+            ax1.grid(True, alpha=0.3)
+            
+            # Subplot 2: Orientation comparison (Euler angles)
+            # Normalize euler angles to [0, 1] for RGB color mapping
+            euler_min = np.minimum(action_euler_array.min(axis=0), actual_euler_array.min(axis=0))
+            euler_max = np.maximum(action_euler_array.max(axis=0), actual_euler_array.max(axis=0))
+            euler_range = euler_max - euler_min
+            euler_range[euler_range == 0] = 1  # Avoid division by zero
+            
+            # Normalize action euler angles
+            action_euler_normalized = (action_euler_array - euler_min) / euler_range
+            # Normalize actual euler angles
+            actual_euler_normalized = (actual_euler_array - euler_min) / euler_range
+            
+            # Plot orientation comparison with RGB colors
+            # Action: solid lines
+            ax2.plot(steps, action_euler_array[:, 0], 'r-', linewidth=2, label='Action Roll', alpha=0.8)
+            ax2.plot(steps, action_euler_array[:, 1], 'g-', linewidth=2, label='Action Pitch', alpha=0.8)
+            ax2.plot(steps, action_euler_array[:, 2], 'b-', linewidth=2, label='Action Yaw', alpha=0.8)
+            
+            # Actual: dashed lines
+            ax2.plot(steps, actual_euler_array[:, 0], 'r--', linewidth=2, label='Actual Roll', alpha=0.8)
+            ax2.plot(steps, actual_euler_array[:, 1], 'g--', linewidth=2, label='Actual Pitch', alpha=0.8)
+            ax2.plot(steps, actual_euler_array[:, 2], 'b--', linewidth=2, label='Actual Yaw', alpha=0.8)
+            
+            ax2.set_xlabel('Step', fontsize=12)
+            ax2.set_ylabel('Orientation (rad)', fontsize=12)
+            ax2.set_title('Action vs Actual Robot Orientation Comparison (Euler XYZ)\n(Solid: Action, Dashed: Actual)', fontsize=14)
+            ax2.legend(loc='best', ncol=2)
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Save figure to output_dir
+            fig_path = os.path.join(output_dir, "action_vs_actual_pose_comparison.png")
+            plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+            print(f"Saved action vs actual pose comparison plot to {fig_path}")
             
             plt.close()
         

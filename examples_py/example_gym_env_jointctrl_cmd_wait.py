@@ -216,7 +216,7 @@ def backproject_pixel(K, u, v, depth, dist_coeffs=None):
     x = (u_undist - cx) * z / fx
     y = (v_undist - cy) * z / fy
     return np.array([x, y, z])
-    
+
 def get_dift_point_base_frame_data_for_debug(camera_matrix=None, dist_coeffs=None):
     import zarr
     from im2flow2act.common.utility.zarr import parallel_reading
@@ -418,7 +418,7 @@ def main():
                                        current_orientation_wxyz[3], current_orientation_wxyz[0]])  # [x,y,z,w]
 
         # Define square vertices in YZ plane (0.1m x 0.1m square)
-        square_size = 0.2  # 0.1m
+        square_size = 0.1  # 0.1m
         # square_vertices = [
         #     original_position + np.array([0.0, 0.0, 0.0]),           # Start point
         #     original_position + np.array([0.0, square_size, 0.0]),   # Y+0.1
@@ -439,17 +439,17 @@ def main():
         # D435 depth-based dift point (leftside bottle cap): array([0.592886  , 0.24988669, 0.1399751 ]), (on the socket): array([ 0.58816114, -0.0290327 , -0.00381193]), 
         # unidepth-based dift point (leftside bottle cap): array([0.62878956, 0.22977131, 0.13334631]), (on the socket): array([0.52487209, 0.02690133, 0.01839266]), 
         # NOTE
-        dift_point_base_frame, dift_point_marker_frame, point_in_front_of_the_marker_base_frame = get_dift_point_base_frame_data_for_debug() # [T, N, 3]
-        DEBUG_POINT = dift_point_base_frame[0,1] + np.array([0.0, 0.0, 0.1])
-        # DEBUG_POINT = point_in_front_of_the_marker_base_frame
+        # dift_point_base_frame, dift_point_marker_frame, point_in_front_of_the_marker_base_frame = get_dift_point_base_frame_data_for_debug() # [T, N, 3]
+        # DEBUG_POINT = dift_point_base_frame[0,1] + np.array([0.0, 0.0, 0.1])
+        # # DEBUG_POINT = point_in_front_of_the_marker_base_frame
 
-        # proprioception_base_frame = get_estimated_hand_pose_base_frame_data_for_debug() # [T, 7]
-        # DEBUG_POINT = proprioception_base_frame[0, :3] # + np.array([0.0, 0.0, 0.1])
+        # # proprioception_base_frame = get_estimated_hand_pose_base_frame_data_for_debug() # [T, 7]
+        # # DEBUG_POINT = proprioception_base_frame[0, :3] # + np.array([0.0, 0.0, 0.1])
         
         
-        assert DEBUG_ACTION[-1] == 0.0, "assume camera is attached, so the gripper should not be moved"
-        DEBUG_ACTION = np.concatenate([DEBUG_POINT, current_orientation,  np.array([0.0])])
-        print('@@@@@@@@@@@@@@@@@@@@@@@@@ Currently using DEBUG_ACTION :', DEBUG_ACTION)
+        # assert DEBUG_ACTION[-1] == 0.0, "assume camera is attached, so the gripper should not be moved"
+        # DEBUG_ACTION = np.concatenate([DEBUG_POINT, current_orientation,  np.array([0.0])])
+        # print('@@@@@@@@@@@@@@@@@@@@@@@@@ Currently using DEBUG_ACTION :', DEBUG_ACTION)
 
         
         DEBUG_ROLL_ANGLES = [0, 0, 0, 0, 0]
@@ -527,8 +527,8 @@ def main():
             
             start = time.time()
             
-            # env.step(action, wait=False) # a_t
-            env.step(DEBUG_ACTION, wait=False) # a_t
+            env.step(action, wait=False) # a_t
+            # env.step(DEBUG_ACTION, wait=False) # a_t
 
 
             print(f"Step {step}: Started non-blocking execution in {time.time() - start:.6f}s")

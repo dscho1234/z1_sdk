@@ -277,6 +277,7 @@ class FreeDriveDataCollector:
                         joint_angles = robot_state['joint_angles']
                         ee_pos = robot_state['ee_position']
                         ee_quat = robot_state['ee_quaternion']
+                        ee_euler = robot_state['ee_euler']
                         se3_transform = robot_state['T']
                         
                         # Display joint angles
@@ -293,15 +294,19 @@ class FreeDriveDataCollector:
                         cv2.putText(display_image, f"EE Quat: [{ee_quat[0]:.3f}, {ee_quat[1]:.3f}, {ee_quat[2]:.3f}, {ee_quat[3]:.3f}]", 
                                   (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
                         
+                        # Display end effector Euler angles (radian)
+                        cv2.putText(display_image, f"EE Euler: [{ee_euler[0]:.3f}, {ee_euler[1]:.3f}, {ee_euler[2]:.3f}] (rad)", 
+                                  (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                        
                         # Display SE3 transform
                         cv2.putText(display_image, f"SE3 Transform: [{se3_transform[0, 0]:.3f}, {se3_transform[0, 1]:.3f}, {se3_transform[0, 2]:.3f}, {se3_transform[0, 3]:.3f}]", 
-                                  (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                        cv2.putText(display_image, f"               [{se3_transform[1, 0]:.3f}, {se3_transform[1, 1]:.3f}, {se3_transform[1, 2]:.3f}, {se3_transform[1, 3]:.3f}]", 
                                   (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                        cv2.putText(display_image, f"               [{se3_transform[2, 0]:.3f}, {se3_transform[2, 1]:.3f}, {se3_transform[2, 2]:.3f}, {se3_transform[2, 3]:.3f}]", 
+                        cv2.putText(display_image, f"               [{se3_transform[1, 0]:.3f}, {se3_transform[1, 1]:.3f}, {se3_transform[1, 2]:.3f}, {se3_transform[1, 3]:.3f}]", 
                                   (10, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                        cv2.putText(display_image, f"               [{se3_transform[3, 0]:.3f}, {se3_transform[3, 1]:.3f}, {se3_transform[3, 2]:.3f}, {se3_transform[3, 3]:.3f}]", 
+                        cv2.putText(display_image, f"               [{se3_transform[2, 0]:.3f}, {se3_transform[2, 1]:.3f}, {se3_transform[2, 2]:.3f}, {se3_transform[2, 3]:.3f}]", 
                                   (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                        cv2.putText(display_image, f"               [{se3_transform[3, 0]:.3f}, {se3_transform[3, 1]:.3f}, {se3_transform[3, 2]:.3f}, {se3_transform[3, 3]:.3f}]", 
+                                  (10, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
                     else:
                         cv2.putText(display_image, "Robot state unavailable", 
                                   (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
@@ -371,8 +376,10 @@ class FreeDriveDataCollector:
             ee_position = T[:3, 3]
             ee_rotation_matrix = T[:3, :3]
             
-            # Convert rotation matrix to quaternion
-            ee_quaternion = R.from_matrix(ee_rotation_matrix).as_quat()
+            # Convert rotation matrix to quaternion and Euler angles
+            rotation = R.from_matrix(ee_rotation_matrix)
+            ee_quaternion = rotation.as_quat()
+            ee_euler = rotation.as_euler('xyz')  # Euler angles in radians (roll, pitch, yaw)
             
             return {
                 'joint_angles': joint_angles,
@@ -381,6 +388,7 @@ class FreeDriveDataCollector:
                 'gripper_velocity': gripper_vel,
                 'ee_position': ee_position,
                 'ee_quaternion': ee_quaternion,
+                'ee_euler': ee_euler,
                 'ee_rotation_matrix': ee_rotation_matrix,
                 'T' : T,
             }
@@ -569,10 +577,12 @@ class FreeDriveDataCollector:
                     joint_angles = robot_state['joint_angles']
                     ee_pos = robot_state['ee_position']
                     ee_quat = robot_state['ee_quaternion']
+                    ee_euler = robot_state['ee_euler']
                     se3_transform = robot_state['T']
                     print(f"- Joint Angles: [{joint_angles[0]:.3f}, {joint_angles[1]:.3f}, {joint_angles[2]:.3f}, {joint_angles[3]:.3f}, {joint_angles[4]:.3f}, {joint_angles[5]:.3f}]")
                     print(f"  EE Position: [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]")
                     print(f"  EE Quaternion: [{ee_quat[0]:.3f}, {ee_quat[1]:.3f}, {ee_quat[2]:.3f}, {ee_quat[3]:.3f}]")
+                    print(f"  EE Euler: [{ee_euler[0]:.3f}, {ee_euler[1]:.3f}, {ee_euler[2]:.3f}] (rad)")
                     
                 
                 print(f"- Data collected (warmup, not saved)")
