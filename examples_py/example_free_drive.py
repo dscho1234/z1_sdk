@@ -31,6 +31,14 @@ import unitree_arm_interface
 
 
 import pyrealsense2 as rs
+from urdf_parser_py.urdf import URDF
+# ========= Verbose logging control =========
+VERBOSE = False
+
+def vprint(*args, **kwargs) -> None:
+    """Print only when VERBOSE is True."""
+    if VERBOSE:
+        print(*args, **kwargs)
 
 
 # Set numpy print options
@@ -39,7 +47,7 @@ np.set_printoptions(precision=3, suppress=True)
 class FreeDriveDataCollector:
     """Data collector for free drive mode with camera and robot data collection."""
     
-    def __init__(self, output_dir="free_drive_data", has_gripper=True, resolution="HD"):
+    def __init__(self, output_dir="free_drive_data", has_gripper=True, resolution="HD", urdf_path = None):
         """
         Initialize the data collector.
         
@@ -90,6 +98,29 @@ class FreeDriveDataCollector:
         print(f"Camera available: {self.camera_available}")
         print(f"Camera resolution: {self.resolution}")
         print(f"Warmup steps: {self.warmup_steps}")
+
+
+        # for custom FK
+        self.urdf_path = urdf_path
+        self.robot = None
+        self.joint_angles = np.zeros(6)  # 6개 조인트 각도
+        self.link_transforms = {}  # 각 링크의 변환 행렬 저장
+        
+
+        self.joint_limits = [
+            (-2.618, 2.618),   # J1: ±150°
+            (0, 3.142),        # J2: 0—180°
+            (-2.879, 0),       # J3: -165°—0
+            (-1.396, 1.396),   # J4: ±80°
+            (-1.484, 1.484),   # J5: ±85°
+            (-2.793, 2.793)    # J6: ±160°
+        ]
+        
+
+        
+        # URDF 파싱
+        self.parse_urdf()
+        
         
     def _init_camera(self):
         """Initialize RealSense D435 camera."""
@@ -370,7 +401,9 @@ class FreeDriveDataCollector:
             gripper_vel = self.arm.gripperQd if self.has_gripper else 0.0
             
             # Calculate end-effector pose using forward kinematics
-            T = self.arm_model.forwardKinematics(joint_angles, 6)
+            # T = self.arm_model.forwardKinematics(joint_angles, 6)
+            T = self.compute_forward_kinematics(joint_angles)
+            
             
             # Extract position and orientation
             ee_position = T[:3, 3]
@@ -637,6 +670,136 @@ class FreeDriveDataCollector:
             pass
 
 
+    def parse_urdf(self):
+        """URDF 파일을 파싱하여 로봇 구조 정보 추출"""
+        try:
+            self.robot = URDF.from_xml_file(self.urdf_path)
+            vprint(f"URDF 파싱 완료: {len(self.robot.joints)} 개 조인트, {len(self.robot.links)} 개 링크")
+            
+            # 조인트 정보 출력
+            for i, joint in enumerate(self.robot.joints):
+                vprint(f"Joint {i+1}: {joint.name}, Type: {joint.type}, Axis: {joint.axis}")
+                
+        except Exception as e:
+            vprint(f"URDF 파싱 오류: {e}")
+
+    # for custom forward kinematics
+    def compute_forward_kinematics(self, joint_angles, gripper_angle=0.0):
+        """전진기구학 계산 - URDF 기반 (Unitree SDK는 절대 위치를 반환하므로 부적합)"""
+        self.joint_angles = joint_angles.copy()
+        # Unitree Z1 SDK는 절대 위치를 반환하므로 URDF 기반 계산 사용
+        self.compute_forward_kinematics_urdf(gripper_angle)
+        return self.link_transforms['z1_GripperMover'].copy()
+    
+    def compute_forward_kinematics_urdf(self, gripper_angle=0.0):
+        """URDF 기반 전진기구학 계산 (폴백)"""
+        # 조인트 정보를 딕셔너리로 저장
+        joint_info = {}
+        for joint in self.robot.joints:
+            joint_info[joint.name] = joint
+            
+        # 링크 정보를 딕셔너리로 저장
+        link_info = {}
+        for link in self.robot.links:
+            link_info[link.name] = link
+            
+        # 변환 행렬 초기화
+        self.link_transforms = {}
+        
+        # world -> link00 (고정 조인트)
+        self.link_transforms['world'] = np.eye(4)
+        self.link_transforms['link00'] = np.eye(4)
+        
+        # 각 조인트에 대해 변환 행렬 계산
+        joint_angle_idx = 0
+        for joint in self.robot.joints:
+            if joint.type == 'revolute' and joint_angle_idx < len(self.joint_angles):
+                # 조인트 각도
+                angle = self.joint_angles[joint_angle_idx]
+                joint_angle_idx += 1
+                
+                # 조인트 축
+                axis = np.array(joint.axis)
+                
+                # 조인트 원점
+                origin = joint.origin
+                if origin is not None:
+                    xyz = np.array(origin.xyz) if origin.xyz else np.zeros(3)
+                    rpy = np.array(origin.rpy) if origin.rpy else np.zeros(3)
+                else:
+                    xyz = np.zeros(3)
+                    rpy = np.zeros(3)
+                
+                # 회전 행렬 계산 (RPY)
+                if np.any(rpy):
+                    rot_matrix = R.from_euler('xyz', rpy).as_matrix()
+                else:
+                    rot_matrix = np.eye(3)
+                
+                # 조인트 회전 행렬 (축 주위 회전)
+                joint_rot_matrix = R.from_rotvec(axis * angle).as_matrix()
+                
+                # 변환 행렬 구성
+                T_joint = np.eye(4)
+                T_joint[:3, :3] = rot_matrix @ joint_rot_matrix
+                T_joint[:3, 3] = xyz
+                
+                # 부모 링크의 변환 행렬과 결합
+                parent_transform = self.link_transforms.get(joint.parent, np.eye(4))
+                child_transform = parent_transform @ T_joint
+                
+                self.link_transforms[joint.child] = child_transform
+                
+            elif joint.type == 'fixed':
+                # 고정 조인트
+                origin = joint.origin
+                if origin is not None:
+                    xyz = np.array(origin.xyz) if origin.xyz else np.zeros(3)
+                    rpy = np.array(origin.rpy) if origin.rpy else np.zeros(3)
+                else:
+                    xyz = np.zeros(3)
+                    rpy = np.zeros(3)
+                
+                # 회전 행렬 계산
+                if np.any(rpy):
+                    rot_matrix = R.from_euler('xyz', rpy).as_matrix()
+                else:
+                    rot_matrix = np.eye(3)
+                
+                # 변환 행렬 구성
+                T_fixed = np.eye(4)
+                T_fixed[:3, :3] = rot_matrix
+                T_fixed[:3, 3] = xyz
+                
+                # 부모 링크의 변환 행렬과 결합
+                parent_transform = self.link_transforms.get(joint.parent, np.eye(4))
+                child_transform = parent_transform @ T_fixed
+                
+                self.link_transforms[joint.child] = child_transform
+        
+        # Gripper 위치 계산 (URDF 기반 정확한 오프셋 사용)
+        if 'link06' in self.link_transforms:
+            # gripperStator는 link06에서 xyz="0.051 0.0 0.0" 오프셋으로 연결
+            gripper_stator_offset = np.array([0.051, 0.0, 0.0])  # URDF에서 정의된 오프셋
+            gripper_stator_transform = self.link_transforms['link06'].copy()
+            gripper_stator_transform[:3, 3] += gripper_stator_transform[:3, :3] @ gripper_stator_offset
+            
+            self.link_transforms['z1_GripperStator'] = gripper_stator_transform
+            
+            # gripperMover는 gripperStator에서 xyz="0.049 0.0 0" 오프셋으로 연결
+            gripper_mover_offset = np.array([0.049, 0.0, 0.0])  # URDF에서 정의된 오프셋
+            gripper_mover_transform = gripper_stator_transform.copy()
+            gripper_mover_transform[:3, 3] += gripper_mover_transform[:3, :3] @ gripper_mover_offset
+            
+            # gripper 회전 적용 (Y축 주위 회전, URDF에서 axis xyz="0 1 0")
+            if gripper_angle != 0.0:
+                gripper_rotation = R.from_rotvec([0, gripper_angle, 0]).as_matrix()
+                gripper_mover_transform[:3, :3] = gripper_mover_transform[:3, :3] @ gripper_rotation
+            
+            self.link_transforms['z1_GripperMover'] = gripper_mover_transform
+                
+
+
 def main():
     """Main function."""
     print("Z1 Robot Arm Free Drive Data Collection")
@@ -649,8 +812,13 @@ def main():
     # Camera resolution options: "VGA" (640x480), "HD" (1280x720), "FHD" (1920x1080)
     resolution = "VGA" # "FHD"  # Change this to "VGA", "HD", or "FHD" as needed
     
+    
+    urdf_path = "/home/dcho302/Workspace/unitree_ros/robots/z1_description/xacro/z1.urdf"
+    
+
+
     # Create data collector
-    collector = FreeDriveDataCollector(output_dir=output_dir, resolution=resolution)
+    collector = FreeDriveDataCollector(output_dir=output_dir, resolution=resolution, has_gripper=False, urdf_path=urdf_path)
     
     try:
         # Enable free drive mode

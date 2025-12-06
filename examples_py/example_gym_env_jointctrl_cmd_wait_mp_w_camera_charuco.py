@@ -20,34 +20,28 @@ import matplotlib.pyplot as plt
 import signal
 import atexit
 from scipy.ndimage import gaussian_filter1d
+from utils import unwrap_deg, quaternion_align, compute_ortho6d_from_rotation_matrix, compute_rotation_matrix_from_ortho6d
 
 # Add the envs directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "envs"))
 from envs.z1_env_jointctrl_wait_R import EEPoseCtrlJointCmdWrapper
 
-# # custom (hand-made), 3x5 charuco reference marker: 1
-# T_B_M = np.array([[0.00000000, 0.00000000, 1.00000000, 0.76401688],
-#                 [ 0.00000000, -1.00000000, 0.00000000,  0.0615125 ],
-#                 [1.00000000, 0.00000000,  0.00000000,  0.56736933],
-#                 [ 0.,          0.,          0.,          1.        ]])
 
-# # custom (hand-made), 3x5 charuco reference marker: 1 (lowest table)
-T_B_M = np.array([[0.00000000, 0.00000000, 1.00000000, 0.76401688],
-                [ 0.00000000, -1.00000000, 0.00000000,  0.0615125 ],
-                [1.00000000, 0.00000000,  0.00000000,  0.73136933],
-                [ 0.,          0.,          0.,          1.        ]])
 
-# # # custom (hand-made)
-# T_B_M = np.array([[-0.0211232, 0.00961882, -0.99973061, 0.86901688],
-#                 [ 0.00934025, -0.99990818, -0.00981788,  0.0965125 ],
-#                 [-0.99973325, -0.00954512,  0.02103141,  0.55736933],
-#                 [ 0.,          0.,          0.,          1.        ]])
 
-# original (accurate value when we make the robot to reach the [0,0,0.4] in marker coordinate) [0.5507966 , 0.12502528, 0.28048738]
-# T_B_M = np.array([[-0.0211232, 0.00961882, -0.99973061, 0.87401688],
-#                 [ 0.00934025, -0.99990818, -0.00981788,  0.0965125 ],
-#                 [-0.99973325, -0.00954512,  0.02103141,  0.54736933],
-#                 [ 0.,          0.,          0.,          1.        ]])
+# # charuco, view policy setting (from RHWE calibration, fk_debug fix)
+# T_B_M = np.array([[ 0.02165318, 0.69297017, 0.72064103, 0.90887787],
+#                 [-0.05427247, -0.71893243, 0.69295791, 0.35263668],
+#                 [ 0.99829136, -0.05411571, 0.02204203, 0.55767073],
+#                 [ 0.        , 0.        , 0.        , 1.        ]])
+
+# charuco, view policy setting (from RHWE calibration, fk_debug fix, filtered data)
+T_B_M = np.array([[ 0.02191792,  0.69378431, 0.71984924, 0.91460907],
+                [-0.05328004, -0.71818842, 0.6938059, 0.35592764],
+                [ 0.99833904, -0.05356038, 0.02122366, 0.55818676],
+                [ 0.        , 0.        , 0.        , 1.        ]])
+
+
 
 class DummyMLP(nn.Module):
     """Simple dummy MLP model for thread-torch compatibility testing."""
@@ -122,13 +116,20 @@ def init_realsense_camera(resolution="HD"):
         profile = pipeline.get_active_profile()
         color_stream = profile.get_stream(rs.stream.color)
         
-        # camera_matrix = np.array([[592.5122474,    0.,         329.31307053],
-        #                         [  0.,         592.41377421, 248.28416052],
-        #                         [  0.,           0.,           1.        ]])
+        # # halab's d435 with dist
+        # camera_matrix = np.array([[603.67354021, 0.0, 325.35823133],
+        #                         [0.0, 603.48335416, 245.34338517],
+        #                         [0.0, 0.0, 1.0]])
+        # (640, 480), charuco marker, halab D435, with dist=0 calib
+        camera_matrix = np.array([[589.42356484, 0.0, 324.66477806],
+                        [0.0, 589.20431488, 246.12765546],
+                        [0.0, 0.0, 1.0]
+        ], dtype=np.float64)
+        
         # dist_coeffs = np.array([ 4.32352189e-02,  4.27595321e-01,  1.99344572e-03, -7.07460350e-04, -1.65811952e+00])
-        camera_matrix = np.array([[594.77780809,   0.,         330.89839472],
-                                [  0.,         594.59358254, 244.54097395],
-                                [  0.,           0.,           1.        ]])
+        # camera_matrix = np.array([[594.77780809,   0.,         330.89839472],
+        #                         [  0.,         594.59358254, 244.54097395],
+        #                         [  0.,           0.,           1.        ]])
 
         # dist_coeffs = np.array([7.11160300e-02,  1.96758488e-01, -9.70781397e-05, -1.21502610e-03, -1.18364923e+00])
         dist_coeffs = None
@@ -301,6 +302,7 @@ def detect_charuco_board(gray, board, camera_matrix, dist_coeffs):
         
         # 최소 6개 코너 필요
         if len(objp) >= 6:
+            print('len objp: ', len(objp))
             success, rvec_board, tvec_board = cv2.solvePnP(
                 objp, imgp, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
             )
@@ -1067,13 +1069,21 @@ def get_dift_point_base_frame_data_for_debug(camera_matrix=None, dist_coeffs=Non
 
 
     # point_in_front_of_the_marker_homo = np.array([0.0, 0.0, 0.4, 1.0])
-    point_in_front_of_the_marker_homo = np.array([0.0, 0.0, -0.4, 1.0])
+    point_in_front_of_the_marker_homo = np.array([0.0, 0.0, -0.6, 1.0])
     point_in_front_of_the_marker_base_frame = np.einsum('ij,j->i', T_B_M, point_in_front_of_the_marker_homo)[:3]
 
-    
-    return dift_point_base_frame, dift_point_marker_frame, dift_point_tracking_sequence, point_in_front_of_the_marker_base_frame, dift_points_custom_unprojected_c, dift_points_custom_unprojected_b
+    se3_in_front_of_the_marker = np.eye(4)
+    se3_in_front_of_the_marker[:3, :3] = np.array([[0.0, 0.0, 1.0], 
+                                                    [0.0, -1.0, 0.0], 
+                                                    [1.0, 0.0, 0.0]])
 
-def get_estimated_hand_pose_base_frame_data_for_debug(droid=False):
+    se3_in_front_of_the_marker[:3, 3] = point_in_front_of_the_marker_homo[:3]
+    se3_in_front_of_the_marker_base_frame = np.einsum('ij,jk->ik', T_B_M, se3_in_front_of_the_marker) # [4, 4]
+
+    
+    return dift_point_base_frame, dift_point_marker_frame, dift_point_tracking_sequence, point_in_front_of_the_marker_base_frame, dift_points_custom_unprojected_c, dift_points_custom_unprojected_b, se3_in_front_of_the_marker_base_frame
+
+def get_estimated_hand_pose_base_frame_data_for_debug(droid=False, use_proprioception_from_data=True, use_6d_representation=True):
     import zarr
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_eye_calib_debug"
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/test_for_hand_pose_calib_debug"
@@ -1082,6 +1092,9 @@ def get_estimated_hand_pose_base_frame_data_for_debug(droid=False):
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/multi_marker_test_for_hand_pose_calib_debug_w_wrist_depth_scale"
     # data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/charuco_marker_test_for_hand_pose_calib_debug"
     data_buffer_path = "/home/dcho302/slow_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/charuco_marker_static_bottle"
+    
+    assert 'static_bottle' in data_buffer_path, "only static bottle is supported for now (due to different length btw T_mc, proprio)" 
+    
     data_buffer = zarr.open(data_buffer_path, mode="a")
     episode_idx = 0
     all_detected_frame_index = data_buffer[f"episode_{episode_idx}/all_detected_frame_index"][()] # scalar
@@ -1090,46 +1103,52 @@ def get_estimated_hand_pose_base_frame_data_for_debug(droid=False):
     else:
         T_mc_transformation = data_buffer[f"episode_{episode_idx}/T_mc_opt"][:].copy() # [T, 4, 4]
     T = T_mc_transformation.shape[0]
-    
+    if use_proprioception_from_data:
+        proprioception= data_buffer[f"episode_{episode_idx}/proprioception"][:].copy() # [T, 7], camera frame, already smoothed
+        # 0 (open) or 1 (close) for gripper
+        gripper = proprioception[:, -1:].copy()
+        gripper *= 0.8 # [0, 0.8]
+        gripper -= 1.0 # [-1.0, -0.2]
+        proprioception[:, -1:] = gripper
+        
 
-    # original ver
-    # proprioception = data_buffer[f"episode_{episode_idx}/proprioception"][:].copy() # [T, 7], camera frame
 
-    # NOTE: for debug
-    import pickle
-    def load_data_dict(data_path):
-        """Load the data dictionary from pickle file"""
-        with open(data_path, 'rb') as f:
-            data_dict = pickle.load(f)
-        return data_dict
+    else:
+        # NOTE: for debug
+        import pickle
+        def load_data_dict(data_path):
+            """Load the data dictionary from pickle file"""
+            with open(data_path, 'rb') as f:
+                data_dict = pickle.load(f)
+            return data_dict
 
-    data_dict = load_data_dict(data_buffer_path + f'/episode_{episode_idx}/data_dict.pkl')
-    
-    # use first obs
-    R_cg_opt = data_dict['R_cg_opt_trajectory'][:] # [T, 3, 3]
-    R_cg_opt_depth = data_dict['R_cg_opt_depth_trajectory'][:] # [T, 3, 3]
-    t_cg_opt_depth = data_dict['t_cg_opt_depth_trajectory'][:] # [T, 3]
-    t_cg_opt = data_dict['t_cg_opt_trajectory'][:] # [T, 3]
-    t_cg_closed = data_dict['t_cg_closed_trajectory'][:] # [T, 3]
-    euler_cg_opt = R.from_matrix(R_cg_opt).as_euler('xyz') # [T, 3]
-    euler_cg_opt_depth = R.from_matrix(R_cg_opt_depth).as_euler('xyz') # [T, 3]
-    temp_gripper = np.tile(np.array([0.0]), (euler_cg_opt.shape[0], 1)) # [T, 1]
-    # dscho NOTE: depth-based one is much smoother when using accurate T_B_M. accuracy is slightly better.
-    # proprioception = np.concatenate([t_cg_opt_depth, euler_cg_opt, temp_gripper], axis=-1) # [T, 7]
-    # proprioception = np.concatenate([t_cg_opt_depth, euler_cg_opt_depth, temp_gripper], axis=-1) # [T, 7]
-    # proprioception = np.concatenate([t_cg_opt, euler_cg_opt, temp_gripper], axis=-1) # [T, 7]
-    # proprioception = np.concatenate([t_cg_closed, euler_cg_opt, temp_gripper], axis=-1) # [T, 7]
+        data_dict = load_data_dict(data_buffer_path + f'/episode_{episode_idx}/data_dict.pkl')
+        
+        # use first obs
+        R_cg_opt = data_dict['R_cg_opt_trajectory'][:] # [T, 3, 3]
+        R_cg_opt_depth = data_dict['R_cg_opt_depth_trajectory'][:] # [T, 3, 3]
+        t_cg_opt_depth = data_dict['t_cg_opt_depth_trajectory'][:] # [T, 3]
+        t_cg_opt = data_dict['t_cg_opt_trajectory'][:] # [T, 3]
+        t_cg_closed = data_dict['t_cg_closed_trajectory'][:] # [T, 3]
+        euler_cg_opt = R.from_matrix(R_cg_opt).as_euler('xyz') # [T, 3]
+        euler_cg_opt_depth = R.from_matrix(R_cg_opt_depth).as_euler('xyz') # [T, 3]
+        temp_gripper = np.tile(np.array([0.0]), (euler_cg_opt.shape[0], 1)) # [T, 1]
+        # dscho NOTE: depth-based one is much smoother when using accurate T_B_M. accuracy is slightly better.
+        # proprioception = np.concatenate([t_cg_opt_depth, euler_cg_opt, temp_gripper], axis=-1) # [T, 7]
+        # proprioception = np.concatenate([t_cg_opt_depth, euler_cg_opt_depth, temp_gripper], axis=-1) # [T, 7]
+        # proprioception = np.concatenate([t_cg_opt, euler_cg_opt, temp_gripper], axis=-1) # [T, 7]
+        # proprioception = np.concatenate([t_cg_closed, euler_cg_opt, temp_gripper], axis=-1) # [T, 7]
 
-    # debugging (depth scaling)
-    # proprioception[:, :3] = proprioception[:, :3] * 1.05 # 2.5% scaling (custom calibration)
-    # print("@@@@@@@@@@@@@@@@@@@@@@@@@ apply scaling to the proprioception for debugging")
-    # time.sleep(2)
+        # debugging (depth scaling)
+        # proprioception[:, :3] = proprioception[:, :3] * 1.05 # 2.5% scaling (custom calibration)
+        # print("@@@@@@@@@@@@@@@@@@@@@@@@@ apply scaling to the proprioception for debugging")
+        # time.sleep(2)
 
-    smoothing_sigma = 2.0
-    t_cg_opt_depth_smooth = apply_temporal_smoothing(t_cg_opt_depth, smoothing_sigma)
-    euler_cg_opt_depth_smooth = apply_temporal_smoothing(euler_cg_opt_depth, smoothing_sigma)
-    proprioception = np.concatenate([t_cg_opt_depth_smooth, euler_cg_opt_depth_smooth, temp_gripper], axis=-1) # [T, 7]
-    
+        smoothing_sigma = 2.0
+        t_cg_opt_depth_smooth = apply_temporal_smoothing(t_cg_opt_depth, smoothing_sigma)
+        euler_cg_opt_depth_smooth = apply_temporal_smoothing(euler_cg_opt_depth, smoothing_sigma)
+        proprioception = np.concatenate([t_cg_opt_depth_smooth, euler_cg_opt_depth_smooth, temp_gripper], axis=-1) # [T, 7]
+        
     
     # assert proprioception.shape[0] == T_mc_transformation.shape[0]
     
@@ -1141,8 +1160,15 @@ def get_estimated_hand_pose_base_frame_data_for_debug(droid=False):
 
 
     proprioception_se3 = np.tile(np.eye(4), (T, 1, 1)) # [T, 4, 4]
-    proprioception_se3[:, :3, :3] = R.from_euler('xyz', proprioception[:, 3:6]).as_matrix() # [T, 4, 4]
-    proprioception_se3[:, :3, 3] = proprioception[:, :3] # [T, 4, 4]
+
+
+    if use_6d_representation:
+        proprio_rot = compute_rotation_matrix_from_ortho6d(proprioception[:, 3:9]) # [T, 3, 3]
+        proprioception_se3[:, :3, :3] = proprio_rot
+        proprioception_se3[:, :3, 3] = proprioception[:, :3] # [T, 4, 4]
+    else:
+        proprioception_se3[:, :3, :3] = R.from_euler('xyz', proprioception[:, 3:6]).as_matrix() # [T, 4, 4]
+        proprioception_se3[:, :3, 3] = proprioception[:, :3] # [T, 4, 4]
 
     T_bc_transformation = np.einsum('ij,hjk->hik', T_B_M, T_mc_transformation) # [T, 4, 4]
     proprioception_se3_b = np.einsum('hij,hjk->hik', T_bc_transformation, proprioception_se3) # [T, 4, 4]
@@ -1150,8 +1176,9 @@ def get_estimated_hand_pose_base_frame_data_for_debug(droid=False):
     pos = proprioception_se3_b[:, :3, 3] # [T, 3]
     euler = R.from_matrix(proprioception_se3_b[:, :3, :3]).as_euler('xyz')
     quat = R.from_matrix(proprioception_se3_b[:, :3, :3]).as_quat()
-    proprioception_b = np.concatenate([pos, euler, proprioception[:, 6:7]], axis=1) # [T, 7]
-    proprioception_b_quat = np.concatenate([pos, quat, proprioception[:, 6:7]], axis=1) # [T, 8]
+
+    proprioception_b = np.concatenate([pos, euler, proprioception[:, -1:]], axis=1) # [T, 7]
+    proprioception_b_quat = np.concatenate([pos, quat, proprioception[:, -1:]], axis=1) # [T, 8]
 
     # temporary debug
     # proprioception_b = None
@@ -1261,14 +1288,18 @@ def main():
     sequence_length = 16   # Length of future target pose sequences
     step_interval = 1.0 / control_frequency  # Time between steps in seconds
     
+    urdf_path = "/home/dcho302/Workspace/unitree_ros/robots/z1_description/xacro/z1.urdf"
+    
     env = EEPoseCtrlJointCmdWrapper(
-        has_gripper=True,
+        has_gripper=False, #True,
         control_frequency=control_frequency,  # 5Hz control frequency
-        position_tolerance=0.01,
+        position_tolerance=0.005,
         orientation_tolerance=0.1,
         joint_speed=0.5,  # Joint speed limit
         sequence_length=sequence_length,  # Length of future sequences
         use_current_joint_pos_when_ik_fails = False,
+        urdf_path = urdf_path,
+        fk_debug = True,
         
     )
     
@@ -1284,8 +1315,8 @@ def main():
         print("Resetting environment...")
         # joint_angle = np.array([1.0, 1.5, -1.0, -0.54, 0.0, 0.0])
         # joint_angle = np.array([-0.8, 2.572, -1.533, -0.609, 1.493, 1.004])
-        # joint_angle = np.array([0.0, 1.5, -1.0, -0.54, 0.0, 0.0]) #forward
-        joint_angle = np.array([-0.579, 1.581, -0.389, -1.139, 0.484, 1.665]) # lowest table, new demo static bottle
+        joint_angle = np.array([0.0, 1.5, -1.2, -0.54, 0.5, 0.0]) #forward + slight tilt of the gripper
+        # joint_angle = np.array([-0.579, 1.581, -0.389, -1.139, 0.484, 1.665]) # lowest table, new demo static bottle
         # joint_angle = None
         obs = env.reset(joint_angle)
         print(f"Initial observation shape: {obs.shape}")
@@ -1365,7 +1396,7 @@ def main():
         # D435 depth-based dift point (leftside bottle cap): array([0.592886  , 0.24988669, 0.1399751 ]), (on the socket): array([ 0.58816114, -0.0290327 , -0.00381193]), 
         # unidepth-based dift point (leftside bottle cap): array([0.62878956, 0.22977131, 0.13334631]), (on the socket): array([0.52487209, 0.02690133, 0.01839266]), 
         # NOTE
-        dift_point_base_frame, dift_point_marker_frame, dift_point_camera_frame, point_in_front_of_the_marker_base_frame, dift_points_custom_unprojected_c, dift_points_custom_unprojected_b = get_dift_point_base_frame_data_for_debug(camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, droid=droid) # [T, N, 3]
+        dift_point_base_frame, dift_point_marker_frame, dift_point_camera_frame, point_in_front_of_the_marker_base_frame, dift_points_custom_unprojected_c, dift_points_custom_unprojected_b, se3_in_front_of_the_marker_base_frame = get_dift_point_base_frame_data_for_debug(camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, droid=droid) # [T, N, 3]
         # DEBUG_POINT = dift_point_base_frame[0,1] # + np.array([0.0, 0.0, 0.1])
         # DEBUG_POINT = point_in_front_of_the_marker_base_frame
 
@@ -1398,8 +1429,8 @@ def main():
             print(f"  Vertex {i}: {vertex} (Gripper: {gripper_state})")
         print()
 
-        
-        total_steps = 190 # 150 #  10 # proprioception_base_frame.shape[0] # 100
+        total_steps = proprioception_base_frame.shape[0]
+        total_steps = 100 # 150 #  10 # proprioception_base_frame.shape[0] # 100
         inference_time = 0.15  # Inference time in seconds
         
         print(f"Running non-blocking control with overlapped inference for {total_steps} steps")
@@ -1623,11 +1654,17 @@ def main():
             # DEBUG_ACTION = np.concatenate([DEBUG_POINT, current_orientation, np.array([0.0])])
 
             # DEBUG_ACTION = np.concatenate([original_position+np.array([0.0, 0.0, 0.0]), proprioception_quat_base_frame[step*2, 3:7].copy(), np.array([0.0])])
-            DEBUG_ACTION = np.concatenate([proprioception_quat_base_frame[step*2, :7].copy(), np.array([0.0])])
+            # DEBUG_ACTION = np.concatenate([proprioception_quat_base_frame[step*2, :7].copy(), np.array([0.0])])
+            # DEBUG_ACTION = proprioception_quat_base_frame[step*2].copy()
             # DEBUG_ACTION = np.concatenate([proprioception_quat_base_frame[step, :3].copy(), current_orientation, np.array([0.0])])
 
+            
+            se3_in_front_of_the_marker_pos = se3_in_front_of_the_marker_base_frame[:3, 3]
+            se3_in_front_of_the_marker_quat = R.from_matrix(se3_in_front_of_the_marker_base_frame[:3, :3]).as_quat()
+            DEBUG_ACTION = np.concatenate([se3_in_front_of_the_marker_pos, se3_in_front_of_the_marker_quat, np.array([0.0])])
+
             print(f'@@@@@@@@@@@@@@@@@@@@@@@@@ Step {step}: Using DEBUG_ACTION with camera_data (base frame): {DEBUG_ACTION[:3]}')
-            assert DEBUG_ACTION[-1] == 0.0, "assume camera is attached, so the gripper should not be moved"
+            # assert DEBUG_ACTION[-1] == 0.0, "assume camera is attached, so the gripper should not be moved"
             env.step(DEBUG_ACTION, wait=False) # a_t
             
             # env.step(action, wait=False) # a_t
@@ -2070,6 +2107,8 @@ def main():
         
         print()
         print("\nNon-blocking square movement with sequence handling completed successfully!")
+        
+        env.reset(joint_angle=np.array([0.0, 0.01, -0.01, 0.0, 0.0, 0.0]), reset_for_end=True)
         
     except KeyboardInterrupt:
         print("\nInterrupted by user")

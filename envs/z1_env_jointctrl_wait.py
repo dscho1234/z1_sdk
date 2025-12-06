@@ -2,9 +2,6 @@ import sys
 import os
 import numpy as np
 import time
-import multiprocessing as mp
-from multiprocessing import Process, Queue, Event
-import threading
 from typing import Tuple, Dict, Any, Optional, Callable
 import gym
 from gym import spaces
@@ -15,6 +12,7 @@ from scipy.optimize import minimize
 # sys.path.append(os.path.join(os.path.dirname(__file__), "..", "lib"))
 import unitree_arm_interface
 from scipy.spatial.transform import Rotation as R
+from scipy.interpolate import PchipInterpolator, CubicSpline
 
 from urdf_parser_py.urdf import URDF
 import xml.etree.ElementTree as ET
@@ -26,6 +24,39 @@ def vprint(*args, **kwargs) -> None:
     """Print only when VERBOSE is True."""
     if VERBOSE:
         print(*args, **kwargs)
+
+
+def generate_waypoints_and_timepoints(current_positions, desired_positions, dt, buffer_time=0.01, next_desired_positions=None):
+    """
+    Generate waypoints and timepoints for smooth interpolation.
+    
+    If next_desired_positions is provided, creates waypoints that end with a velocity
+    pointing towards the next segment, ensuring smooth transitions between segments.
+    """
+    if next_desired_positions is not None:
+        # Calculate direction to next position
+        direction_to_next = next_desired_positions - desired_positions
+        
+        # Create a small offset in the direction of next position at the end
+        # This ensures the velocity at the end of current segment points towards next segment
+        # The offset should be small enough that we're still "at" desired_positions
+        # but large enough to influence the velocity direction
+        velocity_hint_scale = buffer_time * 0.5  # Small offset to hint velocity direction
+        end_position = desired_positions + direction_to_next * velocity_hint_scale
+        
+        waypoints = np.array([
+            current_positions,
+            desired_positions,  # Reach desired position
+            end_position  # End with slight offset towards next (for velocity continuity)
+        ])
+        # Timepoints: reach desired position early, then transition towards next
+        timepoints = np.array([0, dt - buffer_time, dt])
+    else:
+        # Original behavior when next position is unknown
+        waypoints = np.array([current_positions, desired_positions])
+        timepoints = np.array([0, dt])
+    
+    return waypoints, timepoints
 
 
 # SO3 constraint null objective function
@@ -42,42 +73,6 @@ class SO3Constraint:
         # This measures the deviation from desired rotation
         so3_err = 0.5 * (3 - np.trace(SO3 @ self.SO3_des.T))
         return so3_err
-
-
-def _step_worker_loop(env_instance):
-    """Worker loop that continuously processes step requests."""
-    while True:
-        try:
-            # Wait for step request
-            if hasattr(env_instance, 'step_request_event') and env_instance.step_request_event.wait():
-                env_instance.step_request_event.clear()
-                
-                # Check if we should stop (when close() is called)
-                if not hasattr(env_instance, 'is_initialized') or not env_instance.is_initialized:
-                    break
-                
-                # Execute the step logic
-                start = time.time()
-                # print('start step execution in background thread')
-                # Check if action is chunked (2D) or single (1D)
-                if len(env_instance.pending_action.shape) == 2:
-                    result = env_instance._execute_step_chunk_logic(env_instance.pending_action)
-                else:
-                    result = env_instance._execute_step_logic(env_instance.pending_action)
-                env_instance.step_result_container['result'] = result
-                env_instance.step_result_container['completed'] = True
-                print(f"Step execution completed in background thread in {time.time() - start:.6f}s")
-                
-                # Signal completion
-                env_instance.step_ready.set()
-                
-        except Exception as e:
-            print(f"Error in step execution: {e}")
-            # Put a dummy result to unblock the system
-            dummy_result = (np.zeros(21), 0.0, False, {'error': str(e)})
-            env_instance.step_result_container['result'] = dummy_result
-            env_instance.step_result_container['completed'] = True
-            env_instance.step_ready.set()
 
 
 class Z1BaseEnv(gym.Env):
@@ -429,23 +424,6 @@ class Z1BaseEnv(gym.Env):
     def close(self):
         """Clean up the environment."""
         if self.is_initialized:
-            # Wait for inference process to finish if running
-            if hasattr(self, 'inference_process') and self.inference_process and self.inference_process.is_alive():
-                print("Waiting for inference process to finish...")
-                self.inference_process.join(timeout=1.0)
-                if self.inference_process.is_alive():
-                    self.inference_process.terminate()
-            
-            # Wait for step thread to finish if running
-            if hasattr(self, 'step_thread') and self.step_thread and self.step_thread.is_alive():
-                print("Waiting for step thread to finish...")
-                # Signal the thread to stop by setting a stop flag
-                if hasattr(self, 'step_request_event'):
-                    self.step_request_event.set()  # This will cause the thread to exit
-                self.step_thread.join(timeout=1.0)
-                if self.step_thread.is_alive():
-                    print("Warning: Step thread did not finish within timeout")
-            
             self.arm.backToStart()
             self.arm.loopOff()
             self.is_initialized = False
@@ -600,7 +578,9 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
                  use_current_joint_pos_when_ik_fails = True,
                  T_E_C: np.ndarray = None,
                  urdf_path = None,
-                 fk_debug = True, 
+                 fk_debug = True,
+                 interpolator_option: str = 'Cubic',
+                 custom_speed_factor: float = 1.0,
                  ):
         """
         Initialize the end-effector pose control wrapper using joint commands with RTC support.
@@ -612,6 +592,8 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             orientation_tolerance: Orientation tolerance for convergence
             joint_speed: Joint speed for jointCtrlCmd commands (range: [0, π])
             sequence_length: Length of future target pose sequences from inference
+            interpolator_option: Interpolator type - "Pchip" or "Cubic" (default: "Cubic")
+            custom_speed_factor: Speed factor for interpolator velocities (default: 1.0)
             
         """
         super().__init__(has_gripper, control_frequency, urdf_path)
@@ -623,6 +605,8 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         self.orientation_tolerance = orientation_tolerance
         self.joint_speed = joint_speed
         self.sequence_length = sequence_length
+        self.interpolator_option = interpolator_option
+        self.custom_speed_factor = custom_speed_factor
         
         # Store previous step's joint directions for continuous movement during inference
         self.previous_joint_directions = np.zeros(7)  # [J1, J2, J3, J4, J5, J6, gripper]
@@ -633,18 +617,11 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         self.prev_final_error_ori = None
         self.prev_null_obj_val = None
         
-        # Non-blocking inference system using multiprocessing
-        self.action_queue = Queue()
-        self.inference_process = None
-        self.inference_ready = Event()
-        
-        # Non-blocking step execution system using threading
-        self.step_thread = None
-        self.step_result_container = {}
-        self.step_ready = threading.Event()
-        self.step_thread_created = False
-        self.step_request_event = threading.Event()
-        self.pending_action = None
+        # For compatibility with Z1 environment interface
+        # Store last step result for is_step_complete() and get_step_result()
+        self.last_step_result = None
+        self.last_step_complete = True  # Initially complete (no step executed yet)
+        self.last_step_start_time = None  # Track when non-blocking step started
         
         # RTC-style future sequence handling
         self.current_sequence = None  # Current future target pose sequence
@@ -731,19 +708,10 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         self.chunk_completed_actions = set()
         self.current_chunk_horizon = 0
         
-        # Create step thread once during reset for reuse
-        if not self.step_thread_created:
-            self.step_thread = threading.Thread(
-                target=_step_worker_loop,
-                args=(self,),
-                daemon=True
-            )
-            self.step_thread_created = True
-            self.step_thread.start()
-            print("Created reusable step thread")
-        
-        # Initialize step ready event for first step
-        self.step_ready.set()  # Set initially so first step can proceed
+        # Reset compatibility variables
+        self.last_step_result = None
+        self.last_step_complete = True
+        self.last_step_start_time = None
         
         return self._get_observation()
     
@@ -757,6 +725,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             action: [x, y, z, qx, qy, qz, qw, gripper] target pose (quaternion in [x,y,z,w] format)
                    or [horizon, 8] array for chunked execution
             wait: If True, wait for step to complete before returning. If False, execute step in background.
+                  Note: wait parameter is kept for compatibility but always executes blocking.
             
         Returns:
             observation: Current observation
@@ -764,70 +733,19 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             done: Whether episode is done
             info: Additional information
         """
+        # Mark step as not complete at the start (for is_step_complete() compatibility)
+        # self.last_step_complete = False
+        # self.last_step_start_time = time.time()
+        
         # Check if action is chunked (2D) or single (1D)
         if len(action.shape) == 2:
             # action : [horizon, dim]
-            if wait:
-                return self._execute_step_chunk_logic(action)
-            else:
-                # Non-blocking chunk execution - use reusable background thread
-                if not self.step_ready.is_set():
-                    print("Warning: Step is already running in background. Ignoring new step request.")
-                    # Return current state if step is already running
-                    self._update_state()
-                    observation = self._get_observation()
-                    reward = self._get_reward()
-                    done = self._is_done()
-                    info = {'fsm_state': self.arm.getCurrentState(), 'step_running': True}
-                    return observation, reward, done, info
-                
-                # Reset result container and event
-                self.step_result_container = {'result': None, 'completed': False}
-                self.step_ready.clear()
-                
-                # Set pending action and signal the worker thread
-                self.pending_action = action
-                self.step_request_event.set()
-                
-                # Return immediately with current state
-                self._update_state()
-                observation = self._get_observation()
-                reward = self._get_reward()
-                done = self._is_done()
-                info = {'fsm_state': self.arm.getCurrentState(), 'step_running': True}
-                return observation, reward, done, info
+            # return self._execute_step_chunk_logic(action)
+            return self._execute_step_chunk_logic_with_interpolator(action)
         elif len(action.shape) == 1:
             # Single action
-            if wait:
-                # Blocking execution - execute step logic directly
-                return self._execute_step_logic(action)
-            else:
-                # Non-blocking execution - use reusable background thread
-                if not self.step_ready.is_set():
-                    print("Warning: Step is already running in background. Ignoring new step request.")
-                    # Return current state if step is already running
-                    self._update_state()
-                    observation = self._get_observation()
-                    reward = self._get_reward()
-                    done = self._is_done()
-                    info = {'fsm_state': self.arm.getCurrentState(), 'step_running': True}
-                    return observation, reward, done, info
-                
-                # Reset result container and event
-                self.step_result_container = {'result': None, 'completed': False}
-                self.step_ready.clear()
-                
-                # Set pending action and signal the worker thread
-                self.pending_action = action
-                self.step_request_event.set()
-                
-                # Return immediately with current state
-                self._update_state()
-                observation = self._get_observation()
-                reward = self._get_reward()
-                done = self._is_done()
-                info = {'fsm_state': self.arm.getCurrentState(), 'step_running': True}
-                return observation, reward, done, info
+            # return self._execute_step_logic(action)
+            return self._execute_step_logic_with_interpolator(action)
     
     def _execute_step_logic(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         """
@@ -842,6 +760,10 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             done: Whether episode is done
             info: Additional information
         """
+        # Note: last_step_complete and last_step_start_time are already set in step() method
+        self.last_step_complete = False  # Already set in step()
+        
+        
         print('@@@@@@@@@@@@@ in _execute_step_logic function, action :', action)
         # Update target pose from action
         # action format: [x, y, z, qx, qy, qz, qw, gripper]
@@ -853,13 +775,13 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
 
 
         if self.T_E_C is not None:
-                # assume input action is T_bc
-                T_bc = np.eye(4)
-                T_bc[:3, :3] = R.from_quat(self.target_orientation).as_matrix()
-                T_bc[:3, 3] = self.target_position
-                T_be = T_bc @ np.linalg.inv(self.T_E_C)
-                self.target_position = T_be[:3, 3]
-                self.target_orientation = R.from_matrix(T_be[:3, :3]).as_quat()
+            # assume input action is T_bc
+            T_bc = np.eye(4)
+            T_bc[:3, :3] = R.from_quat(self.target_orientation).as_matrix()
+            T_bc[:3, 3] = self.target_position
+            T_be = T_bc @ np.linalg.inv(self.T_E_C)
+            self.target_position = T_be[:3, 3]
+            self.target_orientation = R.from_matrix(T_be[:3, :3]).as_quat()
 
         # Get current state
         self._update_state()
@@ -878,23 +800,58 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         print(f'joint_directions : {joint_directions}')
         print(f'actual_joint_speed : {actual_joint_speed}')
         
-        # Calculate dt ratio for internal loop
-        dt_ratio = int(self.dt / self.arm._ctrlComp.dt)
-        start = time.time()
+
+        
+        self.last_step_start_time = start_time = time.time()
+        
+        
+        end_time = start_time + self.dt
         sleep_time_list = []
-        # Execute jointCtrlCmd for dt_ratio iterations
-        for i in range(dt_ratio):
+        while time.time() < end_time:
+            loop_start_time = time.time()
+            current_time = loop_start_time - start_time
             self.arm.jointCtrlCmd(joint_directions, self.joint_speed)
             sleep_start = time.time()
             time.sleep(self.arm._ctrlComp.dt)
             sleep_time = time.time() - sleep_start
             sleep_time_list.append(sleep_time)
-        cmd_time = time.time() - start
+            
+
+        cmd_time = time.time() - start_time
+        print("cmd time: ", cmd_time)
+        print("sleep time mean:", np.array(sleep_time_list).mean())
+        print("sleep time std: ", np.array(sleep_time_list).std())
+        print("sleep time max: ", np.array(sleep_time_list).max())
+        print("sleep time min: ", np.array(sleep_time_list).min())
+
+
+
+
+
+        # # Calculate dt ratio for internal loop
+        # dt_ratio = int(self.dt / self.arm._ctrlComp.dt)
+        # # Note: last_step_start_time is already set in step() method
+        # start_time = self.last_step_start_time
+        # sleep_time_list = []
+        # # Execute jointCtrlCmd for dt_ratio iterations
+        # for i in range(dt_ratio):
+        #     print(i)
+        #     self.arm.jointCtrlCmd(joint_directions, self.joint_speed)
+        #     sleep_start = time.time()
+        #     time.sleep(self.arm._ctrlComp.dt)
+        #     sleep_time = time.time() - sleep_start
+        #     sleep_time_list.append(sleep_time)
+        # cmd_time = time.time() - start_time
         # print("cmd time: ", cmd_time)
         # print("sleep time mean:", np.array(sleep_time_list).mean())
         # print("sleep time std: ", np.array(sleep_time_list).std())
         # print("sleep time max: ", np.array(sleep_time_list).max())
         # print("sleep time min: ", np.array(sleep_time_list).min())
+
+
+
+
+
         # Update state and get results
         self._update_state()
         observation = self._get_observation()
@@ -915,13 +872,234 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             'joint_directions': joint_directions.copy(),
             'actual_joint_speed': actual_joint_speed,
             'gripper_speed': gripper_speed,
-            'dt_ratio': dt_ratio,
+            # 'dt_ratio': dt_ratio,
             'current_ee_pose_before_cmd': current_ee_pose_before_cmd.copy(),
         }
+        
+        
+        
+        # Store result for compatibility with get_step_result()
+        result = (observation, reward, done, info)
+        self.last_step_result = result
+        # print("last_step_result: ", self.last_step_result)
+
+
+
+        # Mark as complete for blocking execution
+        self.last_step_complete = True
+        self.last_step_start_time = None
+
         
         self.episode_step += 1
         return observation, reward, done, info
     
+    def _execute_step_logic_with_interpolator(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        """
+        Execute the core step logic. This method contains the actual step execution code.
+        
+        Args:
+            action: [x, y, z, qx, qy, qz, qw, gripper] target pose (quaternion in [x,y,z,w] format)
+            
+        Returns:
+            observation: Current observation
+            reward: Reward for this step
+            done: Whether episode is done
+            info: Additional information
+        """
+        # Note: last_step_complete and last_step_start_time are already set in step() method
+        self.last_step_complete = False  # Already set in step()
+        
+        
+        print('@@@@@@@@@@@@@ in _execute_step_logic_with_interpolator function, action :', action)
+        # Update target pose from action
+        # action format: [x, y, z, qx, qy, qz, qw, gripper]
+        self.target_position = action[:3]
+        self.target_orientation = self._normalize_quaternion(action[3:7])  # [qx, qy, qz, qw]
+        if self.has_gripper:
+            self.target_gripper = action[7]
+        
+
+
+        if self.T_E_C is not None:
+            # assume input action is T_bc
+            T_bc = np.eye(4)
+            T_bc[:3, :3] = R.from_quat(self.target_orientation).as_matrix()
+            T_bc[:3, 3] = self.target_position
+            T_be = T_bc @ np.linalg.inv(self.T_E_C)
+            self.target_position = T_be[:3, 3]
+            self.target_orientation = R.from_matrix(T_be[:3, :3]).as_quat()
+
+        # Get current state
+        self._update_state()
+        current_ee_pose = self._get_current_ee_pose()
+        current_ee_pose_before_cmd = current_ee_pose.copy()
+        current_pos = current_ee_pose[:3]
+        current_quat = current_ee_pose[3:7]
+        current_gripper_pos = current_ee_pose[7] if self.has_gripper else 0.0
+        
+        # Calculate target joint positions using IK (similar to _calculate_joint_directions)
+        target_T = self._pose_to_transformation_matrix(self.target_position, self.target_orientation)
+        current_joint_pos = self.current_joint_pos
+        
+        # Use inverse kinematics to get target joint positions
+        ik_type = getattr(self, 'ik_type', 'jacobian')  # Default to 'jacobian' if not set
+        if ik_type == 'null_space':
+            success, target_joint_pos, iterations, final_error_pos, null_obj_val = self.solve_ik_null_space(
+                target_T, 
+                initial_guess=current_joint_pos,
+                max_iterations=50,
+                tolerance=1e-2,
+                tolerance_null=1e-3
+            )
+            final_error_ori = 0.0
+        elif ik_type == 'jacobian':
+            success, target_joint_pos, iterations, final_error_pos, final_error_ori, null_obj_val = self.solve_ik_6d_dls_jacobian(
+                target_T, 
+                initial_guess=current_joint_pos,
+                max_iterations=50,
+                tolerance_pos=1e-3,
+                tolerance_ori=2e-2,
+                w_pos=1.0,
+                w_ori=0.1,
+                lambda0=1e-3,
+                use_adaptive_damping=True,
+                damp_gain=1e-2,
+                alpha_init=1.0,
+                joint_clip=True,
+            )
+        
+        if not success:
+            print(f"Warning: Z1 IK failed to converge (error_pos: {final_error_pos:.6f}, error_ori: {final_error_ori:.6f}, null_obj: {null_obj_val:.6f})")
+            if self.use_current_joint_pos_when_ik_fails:
+                target_joint_pos = current_joint_pos.copy()
+            else:
+                self.prev_final_error_pos = final_error_pos
+                self.prev_final_error_ori = final_error_ori
+                self.prev_null_obj_val = null_obj_val
+        else:
+            print(f"Z1 IK solved successfully in {iterations} iterations (error: {final_error_pos:.6f}, error_ori: {final_error_ori:.6f}, null_obj: {null_obj_val:.6f})")
+            self.prev_final_error_pos = final_error_pos
+            self.prev_final_error_ori = final_error_ori
+            self.prev_null_obj_val = null_obj_val
+        
+        self.prev_target_joint_pos = target_joint_pos.copy()
+        
+        # Get current positions (arm + gripper)
+        current_positions = np.concatenate([self.current_joint_pos, [current_gripper_pos]])
+        desired_positions = np.concatenate([target_joint_pos, [self.target_gripper]])
+        
+        # Generate waypoints and timepoints for smooth interpolation
+        waypoints, timepoints = generate_waypoints_and_timepoints(
+            current_positions,
+            desired_positions,
+            self.dt
+        )
+        
+        # Create interpolator (using PchipInterpolator for smooth interpolation)
+        if self.interpolator_option == 'Pchip':
+            interpolator_position = PchipInterpolator(timepoints, waypoints, axis=0)
+            interpolator_feedforward_velocity = interpolator_position.derivative()
+        elif self.interpolator_option == 'Cubic':
+            interpolator_position = CubicSpline(timepoints, waypoints, axis=0, bc_type='natural')
+            interpolator_feedforward_velocity = interpolator_position.derivative()
+        else:
+            interpolator_position = PchipInterpolator(timepoints, waypoints, axis=0)
+            interpolator_feedforward_velocity = interpolator_position.derivative()
+        
+        # Execute jointCtrlCmd with interpolator
+        self.last_step_start_time = start_time = time.time()
+        end_time = start_time + self.dt
+        sleep_time_list = []
+        
+        # Initialize joint_directions, actual_joint_speed, gripper_speed for info dict
+        joint_directions = np.zeros(7)
+        actual_joint_speed = 0.0
+        gripper_speed = 0.0
+        iter =0 
+        while time.time() < end_time:
+            loop_start_time = time.time()
+            current_time = loop_start_time - start_time
+            
+            # Evaluate interpolator at current time
+            eval_time = np.clip(current_time, timepoints[0], timepoints[-1])
+            interpolated_positions = interpolator_position(eval_time)
+            interpolated_velocities = interpolator_feedforward_velocity(eval_time) * self.custom_speed_factor
+            
+            # Extract interpolated joint positions, velocities and gripper position
+            interpolated_joint_pos = interpolated_positions[:6]
+            interpolated_joint_vel = interpolated_velocities[:6]
+            interpolated_gripper_pos = interpolated_positions[6] if self.has_gripper else 0.0
+            interpolated_gripper_vel = interpolated_velocities[6] if self.has_gripper else 0.0
+            
+            joint_direction = np.array([interpolated_joint_vel[0], 
+                                        interpolated_joint_vel[1], 
+                                        interpolated_joint_vel[2], 
+                                        interpolated_joint_vel[3], 
+                                        interpolated_joint_vel[4], 
+                                        interpolated_joint_vel[5], 
+                                        interpolated_gripper_vel])
+            
+            iter += 1
+            self.arm.jointCtrlCmd(joint_direction, 1.0) # qd = direction*jointSpeed
+            sleep_start = time.time()
+            time.sleep(self.arm._ctrlComp.dt)
+            sleep_time = time.time() - sleep_start
+            sleep_time_list.append(sleep_time)
+            
+        cmd_time = time.time() - start_time
+        print("cmd time: ", cmd_time)
+        print("sleep time mean:", np.array(sleep_time_list).mean())
+        print("sleep time std: ", np.array(sleep_time_list).std())
+        print("sleep time max: ", np.array(sleep_time_list).max())
+        print("sleep time min: ", np.array(sleep_time_list).min())
+
+
+
+
+
+
+
+        # Update state and get results
+        self._update_state()
+        observation = self._get_observation()
+        reward = self._get_reward()
+        done = self._is_done()
+        
+        # Create info dictionary
+        info = {
+            'fsm_state': self.arm.getCurrentState(),
+            'target_position': self.target_position.copy(),
+            'target_orientation': self.target_orientation.copy(),
+            'current_ee_pose': self._get_current_ee_pose(),
+            'current_cam_pose': self._get_current_camera_pose_for_obs(),
+            'position_error': np.linalg.norm(self.target_position - self._get_current_ee_position()),
+            'orientation_error': self._quaternion_distance(
+                self.target_orientation, self._get_current_ee_orientation()
+            ),
+            'joint_directions': joint_directions.copy(),
+            'actual_joint_speed': actual_joint_speed,
+            'gripper_speed': gripper_speed,
+            # 'dt_ratio': dt_ratio,
+            'current_ee_pose_before_cmd': current_ee_pose_before_cmd.copy(),
+        }
+        
+        
+        
+        # Store result for compatibility with get_step_result()
+        result = (observation, reward, done, info)
+        self.last_step_result = result
+        # print("last_step_result: ", self.last_step_result)
+
+
+
+        # Mark as complete for blocking execution
+        self.last_step_complete = True
+        self.last_step_start_time = None
+
+        
+        self.episode_step += 1
+        return observation, reward, done, info
+
     def _execute_step_chunk_logic(self, actions: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         """
         Execute a chunk of steps with end-effector pose control using jointCtrlCmd.
@@ -938,7 +1116,11 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         """
         assert len(actions.shape) == 2, f"Expected actions shape [horizon, 8], got {actions.shape}"
         horizon = actions.shape[0]
-        assert actions.shape[1] == 8, f"Expected action dimension 8, got {actions.shape[1]}"
+        
+        
+        # Note: last_step_complete and last_step_start_time are already set in step() method
+        # self.last_step_complete = False  # Already set in step()
+        # self.last_step_start_time = time.time()  # Already set in step()
         
         # Initialize chunk tracking
         self.chunk_intermediate_results = {}
@@ -965,6 +1147,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         
         # Calculate dt ratio for internal loop
         dt_ratio = int(self.dt / self.arm._ctrlComp.dt)
+        # Note: last_step_start_time is already set in step() method
         
         # Execute each action in the chunk sequentially
         for i in range(horizon):
@@ -1069,6 +1252,360 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             'horizon': horizon,
         }
         
+        
+        
+        # Store result for compatibility with get_step_result()
+        result = (observation, reward, done, info)
+        self.last_step_result = result
+        # print("last_step_result: ", self.last_step_result)
+
+        # Mark as complete for blocking execution
+        self.last_step_complete = True
+        self.last_step_start_time = None
+        
+        self.episode_step += 1
+        return observation, reward, done, info
+
+    def _execute_step_chunk_logic_with_interpolator(self, actions: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        """
+        Execute a chunk of steps with end-effector pose control using jointCtrlCmd with interpolator.
+        Pre-computes all IK for the chunk, then executes control using interpolator.
+        
+        Args:
+            actions: [horizon, 8] array of target poses (quaternion in [x,y,z,w] format)
+            
+        Returns:
+            observation: Current observation (after all actions are executed)
+            reward: Reward for this step
+            done: Whether episode is done
+            info: Additional information with horizon-length arrays
+        """
+        assert len(actions.shape) == 2, f"Expected actions shape [horizon, 8], got {actions.shape}"
+        horizon = actions.shape[0]
+        
+        # Note: last_step_complete and last_step_start_time are already set in step() method
+        self.last_step_complete = False
+        
+        # Initialize chunk tracking
+        self.chunk_intermediate_results = {}
+        self.chunk_completed_actions = set()
+        self.current_chunk_horizon = horizon
+        
+        # Get current state
+        self._update_state()
+        current_ee_pose = self._get_current_ee_pose()
+        current_pos = current_ee_pose[:3]
+        current_quat = current_ee_pose[3:7]
+        current_gripper_pos = current_ee_pose[7] if self.has_gripper else 0.0
+        current_joint_pos = self.current_joint_pos
+        
+        # Pre-compute all IK for all actions in the chunk (like step_chunk in widowx_all.py)
+        target_joint_positions = []
+        target_gripper_positions = []
+        target_positions_list = []
+        target_orientations_list = []
+        
+        for i in range(horizon):
+            action = actions[i]
+            
+            # Extract target pose from action
+            target_position = action[:3]
+            target_orientation = self._normalize_quaternion(action[3:7])  # [qx, qy, qz, qw]
+            target_gripper = action[7] if self.has_gripper else 0.0
+            
+            # Apply T_E_C transformation if needed
+            if self.T_E_C is not None:
+                # assume input action is T_bc
+                T_bc = np.eye(4)
+                T_bc[:3, :3] = R.from_quat(target_orientation).as_matrix()
+                T_bc[:3, 3] = target_position
+                T_be = T_bc @ np.linalg.inv(self.T_E_C)
+                target_position = T_be[:3, 3]
+                target_orientation = R.from_matrix(T_be[:3, :3]).as_quat()
+            
+            target_positions_list.append(target_position.copy())
+            target_orientations_list.append(target_orientation.copy())
+            
+            # Calculate target joint positions using IK (similar to _execute_step_logic_with_interpolator)
+            target_T = self._pose_to_transformation_matrix(target_position, target_orientation)
+            
+            # Use inverse kinematics to get target joint positions
+            ik_type = getattr(self, 'ik_type', 'jacobian')  # Default to 'jacobian' if not set
+            if ik_type == 'null_space':
+                success, target_joint_pos, iterations, final_error_pos, null_obj_val = self.solve_ik_null_space(
+                    target_T, 
+                    initial_guess=current_joint_pos if i == 0 else target_joint_positions[-1],
+                    max_iterations=50,
+                    tolerance=1e-2,
+                    tolerance_null=1e-3
+                )
+                final_error_ori = 0.0
+            elif ik_type == 'jacobian':
+                success, target_joint_pos, iterations, final_error_pos, final_error_ori, null_obj_val = self.solve_ik_6d_dls_jacobian(
+                    target_T, 
+                    initial_guess=current_joint_pos if i == 0 else target_joint_positions[-1],
+                    max_iterations=50,
+                    tolerance_pos=1e-3,
+                    tolerance_ori=2e-2,
+                    w_pos=1.0,
+                    w_ori=0.1,
+                    lambda0=1e-3,
+                    use_adaptive_damping=True,
+                    damp_gain=1e-2,
+                    alpha_init=1.0,
+                    joint_clip=True,
+                )
+            
+            if not success:
+                print(f"Warning: Z1 IK failed to converge for action {i} (error_pos: {final_error_pos:.6f}, error_ori: {final_error_ori:.6f}, null_obj: {null_obj_val:.6f})")
+                if self.use_current_joint_pos_when_ik_fails:
+                    target_joint_pos = current_joint_pos.copy() if i == 0 else target_joint_positions[-1].copy()
+                else:
+                    # Use the IK result even if not fully converged
+                    pass
+            else:
+                print(f"Z1 IK solved successfully for action {i} in {iterations} iterations (error: {final_error_pos:.6f}, error_ori: {final_error_ori:.6f}, null_obj: {null_obj_val:.6f})")
+            
+            target_joint_positions.append(target_joint_pos)
+            target_gripper_positions.append(target_gripper)
+        
+        # Convert to numpy arrays
+        target_joint_positions = np.array(target_joint_positions)  # [horizon, 6]
+        target_gripper_positions = np.array(target_gripper_positions)  # [horizon]
+        
+        # Store the last target as the current target (for info dict)
+        self.target_position = target_positions_list[-1]
+        self.target_orientation = target_orientations_list[-1]
+        self.target_gripper = target_gripper_positions[-1]
+        
+        # Build waypoints: [current, target_0, target_1, ..., target_{horizon-1}]
+        # Get current positions (arm + gripper)
+        current_positions = np.concatenate([self.current_joint_pos, [current_gripper_pos]])
+        
+        # Build waypoints array: [current, target_0, target_1, ..., target_{horizon-1}]
+        waypoints = [current_positions]
+        for i in range(horizon):
+            desired_positions = np.concatenate([target_joint_positions[i], [target_gripper_positions[i]]])
+            waypoints.append(desired_positions)
+        waypoints = np.array(waypoints)  # [horizon+1, 7]
+        
+        # Build timepoints: [0, dt, 2*dt, ..., horizon*dt]
+        timepoints = np.array([i * self.dt for i in range(horizon + 1)])
+        
+        # Create interpolator (using PchipInterpolator or CubicSpline for smooth interpolation)
+        if self.interpolator_option == 'Pchip':
+            interpolator_position = PchipInterpolator(timepoints, waypoints, axis=0)
+            interpolator_feedforward_velocity = interpolator_position.derivative()
+        elif self.interpolator_option == 'Cubic':
+            interpolator_position = CubicSpline(timepoints, waypoints, axis=0, bc_type='natural')
+            interpolator_feedforward_velocity = interpolator_position.derivative()
+        else:
+            interpolator_position = PchipInterpolator(timepoints, waypoints, axis=0)
+            interpolator_feedforward_velocity = interpolator_position.derivative()
+        
+        # Lists to collect data at each action (horizon length)
+        timepoint_target_positions = []
+        timepoint_target_orientations = []
+        timepoint_current_ee_poses = []
+        timepoint_current_cam_poses = []
+        timepoint_position_errors = []
+        timepoint_orientation_errors = []
+        timepoint_joint_directions = []
+        timepoint_actual_joint_speeds = []
+        timepoint_gripper_speeds = []
+        
+        # Execute jointCtrlCmd with interpolator
+        self.last_step_start_time = start_time = time.time()
+        total_duration = horizon * self.dt
+        end_time = start_time + total_duration
+        
+        # Track which timepoints have been sampled (sample at dt, 2*dt, ..., (horizon-1)*dt)
+        sampled_timepoints = set()
+        target_timepoints = [i * self.dt for i in range(1, horizon)]  # [dt, 2*dt, ..., (horizon-1)*dt]
+        # last timepoint is computed after while loop
+        
+        sleep_time_list = []
+        iter = 0
+        
+        # Blocking execution: run interpolation loop
+        while time.time() < end_time:
+            loop_start_time = time.time()
+            current_time = loop_start_time - start_time
+            
+            # Evaluate interpolator at current time
+            eval_time = np.clip(current_time, timepoints[0], timepoints[-1])
+            interpolated_positions = interpolator_position(eval_time)
+            interpolated_velocities = interpolator_feedforward_velocity(eval_time) * self.custom_speed_factor
+            
+            # Extract interpolated joint positions, velocities and gripper position
+            interpolated_joint_pos = interpolated_positions[:6]
+            interpolated_joint_vel = interpolated_velocities[:6]
+            interpolated_gripper_pos = interpolated_positions[6] if self.has_gripper else 0.0
+            interpolated_gripper_vel = interpolated_velocities[6] if self.has_gripper else 0.0
+            
+            joint_direction = np.array([interpolated_joint_vel[0], 
+                                        interpolated_joint_vel[1], 
+                                        interpolated_joint_vel[2], 
+                                        interpolated_joint_vel[3], 
+                                        interpolated_joint_vel[4], 
+                                        interpolated_joint_vel[5], 
+                                        interpolated_gripper_vel])
+            
+            iter += 1
+            self.arm.jointCtrlCmd(joint_direction, 1.0)  # qd = direction*jointSpeed
+            sleep_start = time.time()
+            time.sleep(self.arm._ctrlComp.dt)
+            sleep_time = time.time() - sleep_start
+            sleep_time_list.append(sleep_time)
+            
+            # Sample at each target timepoint (dt, 2*dt, ..., horizon*dt)
+            for i, target_time in enumerate(target_timepoints):
+                if target_time not in sampled_timepoints and current_time >= target_time:
+                    # Mark this timepoint as sampled
+                    sampled_timepoints.add(target_time)
+                    
+                    # Update state to get current values at this timepoint
+                    self._update_state()
+                    current_ee_pose = self._get_current_ee_pose()
+                    current_pos_after = current_ee_pose[:3]
+                    current_quat_after = current_ee_pose[3:7]
+                    
+                    # Get target for this timepoint
+                    target_pos = target_positions_list[i]
+                    target_orient = target_orientations_list[i]
+                    
+                    # Calculate errors
+                    position_error = np.linalg.norm(target_pos - current_pos_after)
+                    orientation_error = self._quaternion_distance(target_orient, current_quat_after)
+                    
+                    # Calculate joint directions for info (using interpolated velocities at this timepoint)
+                    target_eval_time = np.clip(target_time, timepoints[0], timepoints[-1])
+                    target_interpolated_velocities = interpolator_feedforward_velocity(target_eval_time) * self.custom_speed_factor
+                    target_interpolated_gripper_vel = target_interpolated_velocities[6] if self.has_gripper else 0.0
+                    joint_directions = np.array([
+                        target_interpolated_velocities[0],
+                        target_interpolated_velocities[1],
+                        target_interpolated_velocities[2],
+                        target_interpolated_velocities[3],
+                        target_interpolated_velocities[4],
+                        target_interpolated_velocities[5],
+                        target_interpolated_gripper_vel
+                    ])
+                    actual_joint_speed = np.linalg.norm(target_interpolated_velocities[:6])
+                    gripper_speed = abs(target_interpolated_gripper_vel)
+                    
+                    # Store collected data
+                    timepoint_target_positions.append(target_pos.copy())
+                    timepoint_target_orientations.append(target_orient.copy())
+                    timepoint_current_ee_poses.append(self._get_current_ee_pose_for_obs().copy())
+                    timepoint_current_cam_poses.append(self._get_current_camera_pose_for_obs().copy())
+                    timepoint_position_errors.append(position_error)
+                    timepoint_orientation_errors.append(orientation_error)
+                    timepoint_joint_directions.append(joint_directions.copy())
+                    timepoint_actual_joint_speeds.append(actual_joint_speed)
+                    timepoint_gripper_speeds.append(gripper_speed)
+                    
+                    # Store intermediate result for this action index (i-th action in chunk, 0-indexed)
+                    action_index = i
+                    self.chunk_intermediate_results[action_index] = {
+                        'target_position': target_pos.copy(),
+                        'target_orientation': target_orient.copy(),
+                        'current_ee_pose': self._get_current_ee_pose_for_obs().copy(),
+                        'current_cam_pose': self._get_current_camera_pose_for_obs().copy(),
+                        'position_error': position_error,
+                        'orientation_error': orientation_error,
+                        'joint_directions': joint_directions.copy(),
+                        'actual_joint_speed': actual_joint_speed,
+                        'gripper_speed': gripper_speed,
+                    }
+                    self.chunk_completed_actions.add(action_index)
+        
+        cmd_time = time.time() - start_time
+        print("cmd time: ", cmd_time)
+        print("sleep time mean:", np.array(sleep_time_list).mean())
+        print("sleep time std: ", np.array(sleep_time_list).std())
+        print("sleep time max: ", np.array(sleep_time_list).max())
+        print("sleep time min: ", np.array(sleep_time_list).min())
+        
+        # Final state update
+        self._update_state()
+        current_ee_pose = self._get_current_ee_pose()
+        current_pos_after = current_ee_pose[:3]
+        current_quat_after = current_ee_pose[3:7]
+        
+        # Calculate errors for final timepoint (last action)
+        position_error = np.linalg.norm(self.target_position - current_pos_after)
+        orientation_error = self._quaternion_distance(self.target_orientation, current_quat_after)
+        
+        # Calculate joint directions for final timepoint
+        final_eval_time = np.clip(total_duration, timepoints[0], timepoints[-1])
+        final_interpolated_velocities = interpolator_feedforward_velocity(final_eval_time) * self.custom_speed_factor
+        final_interpolated_gripper_vel = final_interpolated_velocities[6] if self.has_gripper else 0.0
+        joint_directions = np.array([
+            final_interpolated_velocities[0],
+            final_interpolated_velocities[1],
+            final_interpolated_velocities[2],
+            final_interpolated_velocities[3],
+            final_interpolated_velocities[4],
+            final_interpolated_velocities[5],
+            final_interpolated_gripper_vel
+        ])
+        actual_joint_speed = np.linalg.norm(final_interpolated_velocities[:6])
+        gripper_speed = abs(final_interpolated_gripper_vel)
+        
+        # Store final timepoint data
+        timepoint_target_positions.append(self.target_position.copy())
+        timepoint_target_orientations.append(self.target_orientation.copy())
+        timepoint_current_ee_poses.append(self._get_current_ee_pose_for_obs().copy())
+        timepoint_current_cam_poses.append(self._get_current_camera_pose_for_obs().copy())
+        timepoint_position_errors.append(position_error)
+        timepoint_orientation_errors.append(orientation_error)
+        timepoint_joint_directions.append(joint_directions.copy())
+        timepoint_actual_joint_speeds.append(actual_joint_speed)
+        timepoint_gripper_speeds.append(gripper_speed)
+        
+        # Store final action result (last action in chunk, index = horizon - 1)
+        final_action_index = horizon - 1
+        self.chunk_intermediate_results[final_action_index] = {
+            'target_position': self.target_position.copy(),
+            'target_orientation': self.target_orientation.copy(),
+            'current_ee_pose': self._get_current_ee_pose_for_obs().copy(),
+            'current_cam_pose': self._get_current_camera_pose_for_obs().copy(),
+            'position_error': position_error,
+            'orientation_error': orientation_error,
+            'joint_directions': joint_directions.copy(),
+            'actual_joint_speed': actual_joint_speed,
+            'gripper_speed': gripper_speed,
+        }
+        self.chunk_completed_actions.add(final_action_index)
+        
+        observation = self._get_observation()
+        reward = self._get_reward()
+        done = self._is_done()
+        
+        # Create info dictionary with horizon-length arrays
+        info = {
+            'fsm_state': self.arm.getCurrentState(),
+            'target_position': np.array(timepoint_target_positions),  # [horizon, 3]
+            'target_orientation': np.array(timepoint_target_orientations),  # [horizon, 4]
+            'current_ee_pose': np.array(timepoint_current_ee_poses),  # [horizon, 8]
+            'current_cam_pose': np.array(timepoint_current_cam_poses),  # [horizon, 8]
+            'position_error': np.array(timepoint_position_errors),  # [horizon]
+            'orientation_error': np.array(timepoint_orientation_errors),  # [horizon]
+            'joint_directions': np.array(timepoint_joint_directions),  # [horizon, 7]
+            'actual_joint_speed': np.array(timepoint_actual_joint_speeds),  # [horizon]
+            'gripper_speed': np.array(timepoint_gripper_speeds),  # [horizon]
+            'horizon': horizon,
+        }
+        
+        # Store result for compatibility with get_step_result()
+        result = (observation, reward, done, info)
+        self.last_step_result = result
+
+        # Mark as complete for blocking execution
+        self.last_step_complete = True
+        self.last_step_start_time = None
+        
         self.episode_step += 1
         return observation, reward, done, info
     
@@ -1119,23 +1656,42 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         return self.current_sequence is not None and self.sequence_index < len(self.current_sequence)
     
     def is_step_complete(self) -> bool:
-        """Check if the background step execution is complete."""
-        return self.step_ready.is_set()
+        """
+        Check if the step execution is complete.
+        For compatibility with Z1 environment interface.
+        
+        Returns:
+            True if step is complete, False otherwise
+        """
+        # For blocking execution, always return True
+        if self.last_step_complete:
+            return True
+        else:
+            return False
+
+        # # For non-blocking execution, check if dt has passed
+        # if self.last_step_start_time is not None:
+        #     elapsed_time = time.time() - self.last_step_start_time
+        #     if elapsed_time >= self.dt:
+        #         self.last_step_complete = True
+        #         return True
+        #     return False
+        
+        # # Default to complete if no step has been executed
+        # return True
     
     def get_step_result(self) -> Optional[Tuple[np.ndarray, float, bool, Dict[str, Any]]]:
         """
-        Get the result from the background step execution if it's complete.
+        Get the result from the step execution if it's complete.
+        For compatibility with Z1 environment interface.
         
         Returns:
             Step result tuple if complete, None if still running or no result available
         """
-        if not self.step_ready.is_set():
-            return None  # Still running
-        
-        if self.step_result_container.get('completed', False):
-            return self.step_result_container.get('result', None)
-        
-        return None
+        if not self.is_step_complete():
+            return None
+        # print("in get step result, last_step_result: ", self.last_step_result)
+        return self.last_step_result
     
     def is_action_in_chunk_complete(self, action_index: int) -> bool:
         """
@@ -1791,7 +2347,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         
 
         if not success:
-            print(f"Warning: IK failed to converge (error_pos: {final_error_pos:.6f}, error_ori: {final_error_ori:.6f}, null_obj: {null_obj_val:.6f})")
+            print(f"Warning: Z1 IK failed to converge (error_pos: {final_error_pos:.6f}, error_ori: {final_error_ori:.6f}, null_obj: {null_obj_val:.6f})")
             if self.use_current_joint_pos_when_ik_fails:
                 target_joint_pos = current_joint_pos.copy()
                 # Do not update prev metrics here since we didn't select a solver-produced q

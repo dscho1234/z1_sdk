@@ -59,11 +59,7 @@ def _step_worker_loop(env_instance):
                 # Execute the step logic
                 start = time.time()
                 # print('start step execution in background thread')
-                # Check if action is chunked (2D) or single (1D)
-                if len(env_instance.pending_action.shape) == 2:
-                    result = env_instance._execute_step_chunk_logic(env_instance.pending_action)
-                else:
-                    result = env_instance._execute_step_logic(env_instance.pending_action)
+                result = env_instance._execute_step_logic(env_instance.pending_action)
                 env_instance.step_result_container['result'] = result
                 env_instance.step_result_container['completed'] = True
                 print(f"Step execution completed in background thread in {time.time() - start:.6f}s")
@@ -234,6 +230,8 @@ class Z1BaseEnv(gym.Env):
             
             # Convert target joint angles to target pose using forward kinematics
             if self.fk_debug:
+                # debug
+                print("@@@@@ DEBUG: target ee pose is computed by compute forward kinematics")
                 T_target = self.compute_forward_kinematics(target_joint_angles)
             else:
                 T_target = self.arm_model.forwardKinematics(target_joint_angles, 6)
@@ -299,6 +297,8 @@ class Z1BaseEnv(gym.Env):
             
             # Convert target joint angles to transformation matrix
             if self.fk_debug:
+                # debug
+                print("@@@@@ DEBUG: target ee pose is computed by compute forward kinematics")
                 T_target = self.compute_forward_kinematics(target_joint_angles)
             else:
                 T_target = self.arm._ctrlComp.armModel.forwardKinematics(target_joint_angles, 6)
@@ -656,11 +656,6 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         self.target_orientation = np.array([0, 0, 0, 1])  # x, y, z, w quaternion (identity)
         self.target_gripper = 0.0
         
-        # For chunk action intermediate results tracking
-        self.chunk_intermediate_results = {}  # {action_index: result_dict}
-        self.chunk_completed_actions = set()  # Set of completed action indices
-        self.current_chunk_horizon = 0  # Current chunk size
-        
         # Define action space: [x, y, z, qx, qy, qz, qw, gripper] (8D)
         # Position: [-1, 1] meters, Orientation: [-1, 1] quaternion [x,y,z,w], Gripper: [-1, 1]
         self.action_space = spaces.Box(
@@ -726,11 +721,6 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         self.prev_final_error_ori = None
         self.prev_null_obj_val = None
         
-        # Reset chunk tracking variables
-        self.chunk_intermediate_results = {}
-        self.chunk_completed_actions = set()
-        self.current_chunk_horizon = 0
-        
         # Create step thread once during reset for reuse
         if not self.step_thread_created:
             self.step_thread = threading.Thread(
@@ -755,7 +745,6 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         
         Args:
             action: [x, y, z, qx, qy, qz, qw, gripper] target pose (quaternion in [x,y,z,w] format)
-                   or [horizon, 8] array for chunked execution
             wait: If True, wait for step to complete before returning. If False, execute step in background.
             
         Returns:
@@ -764,70 +753,38 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             done: Whether episode is done
             info: Additional information
         """
-        # Check if action is chunked (2D) or single (1D)
-        if len(action.shape) == 2:
-            # action : [horizon, dim]
-            if wait:
-                return self._execute_step_chunk_logic(action)
-            else:
-                # Non-blocking chunk execution - use reusable background thread
-                if not self.step_ready.is_set():
-                    print("Warning: Step is already running in background. Ignoring new step request.")
-                    # Return current state if step is already running
-                    self._update_state()
-                    observation = self._get_observation()
-                    reward = self._get_reward()
-                    done = self._is_done()
-                    info = {'fsm_state': self.arm.getCurrentState(), 'step_running': True}
-                    return observation, reward, done, info
-                
-                # Reset result container and event
-                self.step_result_container = {'result': None, 'completed': False}
-                self.step_ready.clear()
-                
-                # Set pending action and signal the worker thread
-                self.pending_action = action
-                self.step_request_event.set()
-                
-                # Return immediately with current state
+        
+
+        if wait:
+            # Blocking execution - execute step logic directly
+            return self._execute_step_logic(action)
+        else:
+            # Non-blocking execution - use reusable background thread
+            if not self.step_ready.is_set():
+                print("Warning: Step is already running in background. Ignoring new step request.")
+                # Return current state if step is already running
                 self._update_state()
                 observation = self._get_observation()
                 reward = self._get_reward()
                 done = self._is_done()
                 info = {'fsm_state': self.arm.getCurrentState(), 'step_running': True}
                 return observation, reward, done, info
-        elif len(action.shape) == 1:
-            # Single action
-            if wait:
-                # Blocking execution - execute step logic directly
-                return self._execute_step_logic(action)
-            else:
-                # Non-blocking execution - use reusable background thread
-                if not self.step_ready.is_set():
-                    print("Warning: Step is already running in background. Ignoring new step request.")
-                    # Return current state if step is already running
-                    self._update_state()
-                    observation = self._get_observation()
-                    reward = self._get_reward()
-                    done = self._is_done()
-                    info = {'fsm_state': self.arm.getCurrentState(), 'step_running': True}
-                    return observation, reward, done, info
-                
-                # Reset result container and event
-                self.step_result_container = {'result': None, 'completed': False}
-                self.step_ready.clear()
-                
-                # Set pending action and signal the worker thread
-                self.pending_action = action
-                self.step_request_event.set()
-                
-                # Return immediately with current state
-                self._update_state()
-                observation = self._get_observation()
-                reward = self._get_reward()
-                done = self._is_done()
-                info = {'fsm_state': self.arm.getCurrentState(), 'step_running': True}
-                return observation, reward, done, info
+            
+            # Reset result container and event
+            self.step_result_container = {'result': None, 'completed': False}
+            self.step_ready.clear()
+            
+            # Set pending action and signal the worker thread
+            self.pending_action = action
+            self.step_request_event.set()
+            
+            # Return immediately with current state
+            self._update_state()
+            observation = self._get_observation()
+            reward = self._get_reward()
+            done = self._is_done()
+            info = {'fsm_state': self.arm.getCurrentState(), 'step_running': True}
+            return observation, reward, done, info
     
     def _execute_step_logic(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         """
@@ -850,17 +807,6 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         if self.has_gripper:
             self.target_gripper = action[7]
         
-
-
-        if self.T_E_C is not None:
-                # assume input action is T_bc
-                T_bc = np.eye(4)
-                T_bc[:3, :3] = R.from_quat(self.target_orientation).as_matrix()
-                T_bc[:3, 3] = self.target_position
-                T_be = T_bc @ np.linalg.inv(self.T_E_C)
-                self.target_position = T_be[:3, 3]
-                self.target_orientation = R.from_matrix(T_be[:3, :3]).as_quat()
-
         # Get current state
         self._update_state()
         current_ee_pose = self._get_current_ee_pose()
@@ -907,7 +853,6 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             'target_position': self.target_position.copy(),
             'target_orientation': self.target_orientation.copy(),
             'current_ee_pose': self._get_current_ee_pose(),
-            'current_cam_pose': self._get_current_camera_pose_for_obs(),
             'position_error': np.linalg.norm(self.target_position - self._get_current_ee_position()),
             'orientation_error': self._quaternion_distance(
                 self.target_orientation, self._get_current_ee_orientation()
@@ -917,156 +862,6 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             'gripper_speed': gripper_speed,
             'dt_ratio': dt_ratio,
             'current_ee_pose_before_cmd': current_ee_pose_before_cmd.copy(),
-        }
-        
-        self.episode_step += 1
-        return observation, reward, done, info
-    
-    def _execute_step_chunk_logic(self, actions: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
-        """
-        Execute a chunk of steps with end-effector pose control using jointCtrlCmd.
-        Processes multiple actions sequentially, executing each action for dt duration.
-        
-        Args:
-            actions: [horizon, 8] array of target poses (quaternion in [x,y,z,w] format)
-            
-        Returns:
-            observation: Current observation (after all actions are executed)
-            reward: Reward for this step
-            done: Whether episode is done
-            info: Additional information with horizon-length arrays
-        """
-        assert len(actions.shape) == 2, f"Expected actions shape [horizon, 8], got {actions.shape}"
-        horizon = actions.shape[0]
-        assert actions.shape[1] == 8, f"Expected action dimension 8, got {actions.shape[1]}"
-        
-        # Initialize chunk tracking
-        self.chunk_intermediate_results = {}
-        self.chunk_completed_actions = set()
-        self.current_chunk_horizon = horizon
-        
-        # Get current state
-        self._update_state()
-        current_ee_pose = self._get_current_ee_pose()
-        current_pos = current_ee_pose[:3]
-        current_quat = current_ee_pose[3:7]
-        current_gripper_pos = current_ee_pose[7] if self.has_gripper else 0.0
-        
-        # Lists to collect data at each action (horizon length)
-        timepoint_target_positions = []
-        timepoint_target_orientations = []
-        timepoint_current_ee_poses = []
-        timepoint_current_cam_poses = []
-        timepoint_position_errors = []
-        timepoint_orientation_errors = []
-        timepoint_joint_directions = []
-        timepoint_actual_joint_speeds = []
-        timepoint_gripper_speeds = []
-        
-        # Calculate dt ratio for internal loop
-        dt_ratio = int(self.dt / self.arm._ctrlComp.dt)
-        
-        # Execute each action in the chunk sequentially
-        for i in range(horizon):
-            action = actions[i]
-            
-            # Update target pose from action
-            target_position = action[:3]
-            target_orientation = self._normalize_quaternion(action[3:7])  # [qx, qy, qz, qw]
-            target_gripper = action[7] if self.has_gripper else 0.0
-
-            if self.T_E_C is not None:
-                # assume input action is T_bc
-                T_bc = np.eye(4)
-                T_bc[:3, :3] = R.from_quat(target_orientation).as_matrix()
-                T_bc[:3, 3] = target_position
-                T_be = T_bc @ np.linalg.inv(self.T_E_C)
-                target_position = T_be[:3, 3]
-                target_orientation = R.from_matrix(T_be[:3, :3]).as_quat()
-
-
-
-
-            
-            # Get current state before executing this action
-            self._update_state()
-            current_ee_pose = self._get_current_ee_pose()
-            current_pos = current_ee_pose[:3]
-            current_quat = current_ee_pose[3:7]
-            current_gripper_pos = current_ee_pose[7] if self.has_gripper else 0.0
-            
-            # Calculate joint directions to target pose
-            joint_directions, actual_joint_speed, gripper_speed = \
-                self._calculate_joint_directions(
-                    target_position, target_orientation, target_gripper,
-                    current_pos, current_quat, current_gripper_pos, self.dt
-                )
-            
-            # Execute jointCtrlCmd for dt_ratio iterations
-            for j in range(dt_ratio):
-                self.arm.jointCtrlCmd(joint_directions, self.joint_speed)
-                time.sleep(self.arm._ctrlComp.dt)
-            
-            # Update state after executing this action
-            self._update_state()
-            current_ee_pose_after = self._get_current_ee_pose()
-            current_pos_after = current_ee_pose_after[:3]
-            current_quat_after = current_ee_pose_after[3:7]
-            
-            # Calculate errors
-            position_error = np.linalg.norm(target_position - current_pos_after)
-            orientation_error = self._quaternion_distance(target_orientation, current_quat_after)
-            
-            # Store collected data
-            timepoint_target_positions.append(target_position.copy())
-            timepoint_target_orientations.append(target_orientation.copy())
-            timepoint_current_ee_poses.append(self._get_current_ee_pose_for_obs().copy())
-            timepoint_current_cam_poses.append(self._get_current_camera_pose_for_obs().copy())
-            timepoint_position_errors.append(position_error)
-            timepoint_orientation_errors.append(orientation_error)
-            timepoint_joint_directions.append(joint_directions.copy())
-            timepoint_actual_joint_speeds.append(actual_joint_speed)
-            timepoint_gripper_speeds.append(gripper_speed)
-            
-            # Store intermediate result for this action index
-            action_index = i
-            self.chunk_intermediate_results[action_index] = {
-                'target_position': target_position.copy(),
-                'target_orientation': target_orientation.copy(),
-                'current_ee_pose': self._get_current_ee_pose_for_obs().copy(),
-                'current_cam_pose': self._get_current_camera_pose_for_obs().copy(),
-                'position_error': position_error,
-                'orientation_error': orientation_error,
-                'joint_directions': joint_directions.copy(),
-                'actual_joint_speed': actual_joint_speed,
-                'gripper_speed': gripper_speed,
-            }
-            self.chunk_completed_actions.add(action_index)
-        
-        # Store the last target as the current target (for info dict)
-        self.target_position = target_position
-        self.target_orientation = target_orientation
-        self.target_gripper = target_gripper
-        
-        # Final state update
-        self._update_state()
-        observation = self._get_observation()
-        reward = self._get_reward()
-        done = self._is_done()
-        
-        # Create info dictionary with horizon-length arrays
-        info = {
-            'fsm_state': self.arm.getCurrentState(),
-            'target_position': np.array(timepoint_target_positions),  # [horizon, 3]
-            'target_orientation': np.array(timepoint_target_orientations),  # [horizon, 4]
-            'current_ee_pose': np.array(timepoint_current_ee_poses),  # [horizon, 8]
-            'current_cam_pose': np.array(timepoint_current_cam_poses),  # [horizon, 8]
-            'position_error': np.array(timepoint_position_errors),  # [horizon]
-            'orientation_error': np.array(timepoint_orientation_errors),  # [horizon]
-            'joint_directions': np.array(timepoint_joint_directions),  # [horizon, 7]
-            'actual_joint_speed': np.array(timepoint_actual_joint_speeds),  # [horizon]
-            'gripper_speed': np.array(timepoint_gripper_speeds),  # [horizon]
-            'horizon': horizon,
         }
         
         self.episode_step += 1
@@ -1137,47 +932,6 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         
         return None
     
-    def is_action_in_chunk_complete(self, action_index: int) -> bool:
-        """
-        Check if a specific action within the current chunk has been completed.
-        This allows external processes to poll for completion of individual actions
-        within a chunk, enabling observation collection after each action.
-        
-        Args:
-            action_index: Index of the action within the chunk (0-indexed)
-            
-        Returns:
-            True if the action at action_index has been completed, False otherwise
-        """
-        return action_index in self.chunk_completed_actions
-    
-    def get_action_in_chunk_intermediate_result(self, action_index: int) -> Optional[Dict[str, Any]]:
-        """
-        Get the intermediate result for a specific action within the current chunk.
-        This allows external processes to retrieve observation data (EE pose, etc.)
-        after each individual action completes, even when using chunked execution.
-        
-        Args:
-            action_index: Index of the action within the chunk (0-indexed)
-            
-        Returns:
-            Dictionary containing intermediate result data for the action, or None if not available.
-            The dictionary contains:
-                - 'target_position': Target position for this action [3]
-                - 'target_orientation': Target orientation for this action [4]
-                - 'current_ee_pose': Current EE pose after this action [8]
-                - 'position_error': Position error for this action
-                - 'orientation_error': Orientation error for this action
-                - 'joint_directions': Joint directions for this action [7]
-                - 'actual_joint_speed': Actual joint speed for this action
-                - 'gripper_speed': Gripper speed for this action
-        """
-        if action_index not in self.chunk_intermediate_results:
-            return None
-        
-        result = self.chunk_intermediate_results[action_index].copy()
-        return result
-    
     def _get_observation(self) -> np.ndarray:
         """Get current observation including joint states and end-effector pose."""
         current_ee_pose = self._get_current_ee_pose()
@@ -1201,6 +955,8 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
     def _get_current_ee_pose(self) -> np.ndarray:
         """Get current end-effector pose (position + quaternion in [x,y,z,w] format)."""
         if self.fk_debug:
+            # debug
+            print("@@@@@ DEBUG: current ee pose is computed by compute forward kinematics")
             T = self.compute_forward_kinematics(self.current_joint_pos)
         else:
             # Get current transformation matrix
@@ -1231,6 +987,8 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
     
     def _get_current_camera_pose_for_obs(self) -> np.ndarray:
         if self.fk_debug:
+            # debug
+            print("@@@@@ DEBUG: current ee pose is computed by compute forward kinematics")
             T_be = self.compute_forward_kinematics(self.current_joint_pos)
             # print("@@@@@ DEBUG: T_be pose is computed by forwardKinematics, since we compute T_E_C by computing forwardkinematics")
             # T_be = self.arm_model.forwardKinematics(self.current_joint_pos, 6)
@@ -1238,21 +996,14 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             T_be = self.arm_model.forwardKinematics(self.current_joint_pos, 6)
         T_ec = self.T_E_C.copy()
         T_bc = T_be @ T_ec
-
-        # Extract position
-        position = T_bc[:3, 3]
-        
-        # Extract quaternion from rotation matrix
-        quaternion = self._rotation_matrix_to_quaternion(T_bc[:3, :3])
-        
-        return np.concatenate([position, quaternion])
-
-        # return T_bc.copy()
+        return T_bc.copy()
 
 
     def _get_current_ee_position(self) -> np.ndarray:
         """Get current end-effector position."""
         if self.fk_debug:
+            # debug
+            print("@@@@@ DEBUG: current ee pose is computed by compute forward kinematics")
             T = self.compute_forward_kinematics(self.current_joint_pos)
         else:
             T = self.arm_model.forwardKinematics(self.current_joint_pos, 6)
@@ -1263,6 +1014,8 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         if joint_pos is None:
             joint_pos = self.current_joint_pos
         if self.fk_debug:
+            # debug
+            print("@@@@@ DEBUG: current ee pose is computed by compute forward kinematics")
             T = self.compute_forward_kinematics(joint_pos)
         else:
             T = self.arm_model.forwardKinematics(joint_pos, 6)
@@ -1664,6 +1417,8 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
     def _get_current_ee_orientation(self) -> np.ndarray:
         """Get current end-effector orientation as quaternion in [x,y,z,w] format."""
         if self.fk_debug:
+            # debug
+            print("@@@@@ DEBUG: current ee pose is computed by compute forward kinematics")
             T = self.compute_forward_kinematics(self.current_joint_pos)
         else:
             T = self.arm_model.forwardKinematics(self.current_joint_pos, 6)
@@ -1816,7 +1571,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
                     self.prev_final_error_ori = final_error_ori
                     self.prev_null_obj_val = null_obj_val
         else:
-            print(f"Z1 IK solved successfully in {iterations} iterations (error: {final_error_pos:.6f}, error_ori: {final_error_ori:.6f}, null_obj: {null_obj_val:.6f})")
+            print(f"IK solved successfully in {iterations} iterations (error: {final_error_pos:.6f}, error_ori: {final_error_ori:.6f}, null_obj: {null_obj_val:.6f})")
             # On success, update previous metrics to current
             self.prev_final_error_pos = final_error_pos
             self.prev_final_error_ori = final_error_ori
