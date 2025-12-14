@@ -111,12 +111,13 @@ class Z1BaseEnv(gym.Env):
         self.max_episode_steps = 1000
         
         # Joint limits for IK
+        # NOTE: default value is different from the robot's capable joint angles, so dscho modified it
         self.joint_limits = [
             (-2.618, 2.618),   # J1: ±150°
             (0, 3.142),        # J2: 0—180°
             (-2.879, 0),       # J3: -165°—0
-            (-1.396, 1.396),   # J4: ±80°
-            (-1.484, 1.484),   # J5: ±85°
+            (-1.75, 1.65),      # J4: ±80° # (-1.396, 1.396) (default)
+            (-1.75, 1.6),      # J5: ±85° # (-1.484, 1.484) (default)
             (-2.793, 2.793)    # J6: ±160°
         ]
         
@@ -204,7 +205,7 @@ class Z1BaseEnv(gym.Env):
             self.current_gripper_pos = self.arm.lowstate.getGripperQ()
             self.current_gripper_vel = self.arm.gripperQd
     
-    def _move_to_joint_angles(self, target_joint_angles: np.ndarray, option: str = "IK", ik_type='null_space'):
+    def _move_to_joint_angles(self, target_joint_angles: np.ndarray, option: str = "IK", ik_type='jacobian'):
         """
         Move the robot to specified joint angles using either low-level commands, MoveJ, or IK-based jointCtrlCmd.
         
@@ -243,7 +244,7 @@ class Z1BaseEnv(gym.Env):
             dt_ratio = int(self.dt / self.arm._ctrlComp.dt)
             
             # Maximum iterations to prevent infinite loops (similar to lowcmd duration)
-            max_iterations = 10  
+            max_iterations = 20  
             tolerance = 0.01  # Joint angle tolerance in radians
             
             # Loop until convergence or max iterations
@@ -607,6 +608,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         self.sequence_length = sequence_length
         self.interpolator_option = interpolator_option
         self.custom_speed_factor = custom_speed_factor
+        self.ik_type =  'null_space' # 'jacobian' # 'null_space'
         
         # Store previous step's joint directions for continuous movement during inference
         self.previous_joint_directions = np.zeros(7)  # [J1, J2, J3, J4, J5, J6, gripper]
@@ -818,11 +820,11 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             
 
         cmd_time = time.time() - start_time
-        print("cmd time: ", cmd_time)
-        print("sleep time mean:", np.array(sleep_time_list).mean())
-        print("sleep time std: ", np.array(sleep_time_list).std())
-        print("sleep time max: ", np.array(sleep_time_list).max())
-        print("sleep time min: ", np.array(sleep_time_list).min())
+        # print("cmd time: ", cmd_time)
+        # print("sleep time mean:", np.array(sleep_time_list).mean())
+        # print("sleep time std: ", np.array(sleep_time_list).std())
+        # print("sleep time max: ", np.array(sleep_time_list).max())
+        # print("sleep time min: ", np.array(sleep_time_list).min())
 
 
 
@@ -942,7 +944,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         current_joint_pos = self.current_joint_pos
         
         # Use inverse kinematics to get target joint positions
-        ik_type = getattr(self, 'ik_type', 'jacobian')  # Default to 'jacobian' if not set
+        ik_type = self.ik_type # getattr(self, 'ik_type', 'jacobian')  # Default to 'jacobian' if not set
         if ik_type == 'null_space':
             success, target_joint_pos, iterations, final_error_pos, null_obj_val = self.solve_ik_null_space(
                 target_T, 
@@ -957,7 +959,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
                 target_T, 
                 initial_guess=current_joint_pos,
                 max_iterations=50,
-                tolerance_pos=1e-3,
+                tolerance_pos=1e-2,
                 tolerance_ori=2e-2,
                 w_pos=1.0,
                 w_ori=0.1,
@@ -1047,11 +1049,11 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             sleep_time_list.append(sleep_time)
             
         cmd_time = time.time() - start_time
-        print("cmd time: ", cmd_time)
-        print("sleep time mean:", np.array(sleep_time_list).mean())
-        print("sleep time std: ", np.array(sleep_time_list).std())
-        print("sleep time max: ", np.array(sleep_time_list).max())
-        print("sleep time min: ", np.array(sleep_time_list).min())
+        # print("cmd time: ", cmd_time)
+        # print("sleep time mean:", np.array(sleep_time_list).mean())
+        # print("sleep time std: ", np.array(sleep_time_list).std())
+        # print("sleep time max: ", np.array(sleep_time_list).max())
+        # print("sleep time min: ", np.array(sleep_time_list).min())
 
 
 
@@ -1330,7 +1332,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             target_T = self._pose_to_transformation_matrix(target_position, target_orientation)
             
             # Use inverse kinematics to get target joint positions
-            ik_type = getattr(self, 'ik_type', 'jacobian')  # Default to 'jacobian' if not set
+            ik_type = self.ik_type # getattr(self, 'ik_type', 'jacobian')  # Default to 'jacobian' if not set
             if ik_type == 'null_space':
                 success, target_joint_pos, iterations, final_error_pos, null_obj_val = self.solve_ik_null_space(
                     target_T, 
@@ -1345,7 +1347,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
                     target_T, 
                     initial_guess=current_joint_pos if i == 0 else target_joint_positions[-1],
                     max_iterations=50,
-                    tolerance_pos=1e-3,
+                    tolerance_pos=1e-2,
                     tolerance_ori=2e-2,
                     w_pos=1.0,
                     w_ori=0.1,
@@ -1521,11 +1523,11 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
                     self.chunk_completed_actions.add(action_index)
         
         cmd_time = time.time() - start_time
-        print("cmd time: ", cmd_time)
-        print("sleep time mean:", np.array(sleep_time_list).mean())
-        print("sleep time std: ", np.array(sleep_time_list).std())
-        print("sleep time max: ", np.array(sleep_time_list).max())
-        print("sleep time min: ", np.array(sleep_time_list).min())
+        # print("cmd time: ", cmd_time)
+        # print("sleep time mean:", np.array(sleep_time_list).mean())
+        # print("sleep time std: ", np.array(sleep_time_list).std())
+        # print("sleep time max: ", np.array(sleep_time_list).max())
+        # print("sleep time min: ", np.array(sleep_time_list).min())
         
         # Final state update
         self._update_state()
@@ -1609,6 +1611,98 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         self.episode_step += 1
         return observation, reward, done, info
     
+    def compute_target_pos(self, target_position: np.ndarray, target_orientation: np.ndarray, 
+                            last_successful_joint_pos: Optional[np.ndarray] = None, return_success: bool = False, ik_type: Optional[str] = None ): # tolerance=5e-3, tolerance_null=1e-3
+        """
+        Calculate target joint positions based on target and current poses using IK.
+        Uses inverse kinematics to convert target pose to joint commands.
+        
+        Args:
+            target_position: Target end-effector position
+            target_orientation: Target end-effector orientation (quaternion in [x,y,z,w] format)
+            tolerance: Position tolerance for IK convergence
+            tolerance_null: Null objective tolerance for IK convergence
+            last_successful_joint_pos: Optional last successful joint positions (used when IK fails in step_chunk)
+            return_success: If True, return (target_joint_pos, success) tuple instead of just target_joint_pos
+            
+        Returns:
+            target_joint_pos: Target joint positions (6-element array), or (target_joint_pos, success) if return_success=True
+        """
+        
+        # Apply T_E_C transformation if needed
+        if self.T_E_C is not None:
+            # assume input action is T_bc
+            T_bc = np.eye(4)
+            T_bc[:3, :3] = R.from_quat(target_orientation).as_matrix()
+            T_bc[:3, 3] = target_position
+            T_be = T_bc @ np.linalg.inv(self.T_E_C)
+            target_position = T_be[:3, 3]
+            target_orientation = R.from_matrix(T_be[:3, :3]).as_quat()
+
+
+        # Convert target pose to transformation matrix
+        target_T = self._pose_to_transformation_matrix(target_position, target_orientation)
+        
+        # Get current joint positions
+        current_joint_pos = self.current_joint_pos
+        if ik_type is None:
+            ik_type = self.ik_type
+        # Use inverse kinematics to get target joint positions
+        if ik_type == 'null_space':
+            success, target_joint_pos, iterations, final_error_pos, null_obj_val = self.solve_ik_null_space(
+                target_T, 
+                initial_guess=current_joint_pos,
+                max_iterations=50,
+                tolerance=1e-2,
+                tolerance_null=1e-3,
+            )
+            final_error_ori = 0.0
+        elif ik_type == 'jacobian':
+            success, target_joint_pos, iterations, final_error_pos, final_error_ori, null_obj_val  = self.solve_ik_6d_dls_jacobian(
+                target_T, 
+                initial_guess=current_joint_pos,
+                max_iterations=50,
+                tolerance_pos=1e-2,
+                tolerance_ori=2e-2,
+                w_pos=1.0,
+                w_ori=0.1,
+                lambda0=1e-3,
+                use_adaptive_damping=True,
+                damp_gain=1e-2,
+                alpha_init=1.0,
+            )
+        else:
+            raise ValueError(f"Invalid IK type: {self.ik_type}")
+        
+        if not success:
+            print(f"Z1 Warning: IK failed to converge (error_pos: {final_error_pos:.6f}, error_ori: {final_error_ori:.6f}, null_obj: {null_obj_val:.6f})")
+            if self.use_current_joint_pos_when_ik_fails:
+                # If last_successful_joint_pos is provided (from step_chunk), use it instead of current_joint_pos
+                if last_successful_joint_pos is not None:
+                    target_joint_pos = last_successful_joint_pos.copy()
+                else:
+                    target_joint_pos = current_joint_pos.copy()
+            else:
+                # Use the IK result even if not fully converged
+                print(f"Z1 IK fallback: using current q from solver (curr_err_pos={final_error_pos:.6f}, curr_null={null_obj_val:.6f})")
+                self.prev_final_error_pos = final_error_pos
+                self.prev_final_error_ori = 0.0  # Not computed in null_space IK
+                self.prev_null_obj_val = null_obj_val
+        else:
+            print(f"Z1 IK solved successfully in {iterations} iterations (error: {final_error_pos:.6f}, null_obj: {null_obj_val:.6f})")
+            # On success, update previous metrics to current
+            self.prev_final_error_pos = final_error_pos
+            self.prev_final_error_ori = 0.0  # Not computed in null_space IK
+            self.prev_null_obj_val = null_obj_val
+        
+        # Remember chosen target q for next iteration's comparison
+        self.prev_target_joint_pos = target_joint_pos.copy()
+        
+        if return_success:
+            return target_joint_pos, success
+        else:
+            return target_joint_pos
+
     def set_current_sequence(self, sequence: np.ndarray, start_index: int = 0):
         """
         Set the current target pose sequence for RTC-style execution.
@@ -2312,7 +2406,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
                 initial_guess=current_joint_pos,
                 max_iterations=50,
                 tolerance=1e-2,
-                tolerance_null=1e-3
+                tolerance_null=1e-2
             )
             final_error_ori = 0.0 # temporary value for debug
             
@@ -2322,7 +2416,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
                 target_T, 
                 initial_guess=current_joint_pos,
                 max_iterations=50,
-                tolerance_pos=1e-3,
+                tolerance_pos=1e-2,
                 tolerance_ori=2e-2,
                 w_pos=1.0,
                 w_ori=0.1,
