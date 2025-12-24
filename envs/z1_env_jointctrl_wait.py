@@ -6,7 +6,7 @@ from typing import Tuple, Dict, Any, Optional, Callable
 import gym
 from gym import spaces
 import functools
-from scipy.optimize import minimize
+from scipy.optimize import minimize, least_squares
 
 # Add the lib directory to the path
 # sys.path.append(os.path.join(os.path.dirname(__file__), "..", "lib"))
@@ -582,6 +582,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
                  fk_debug = True,
                  interpolator_option: str = 'Cubic',
                  custom_speed_factor: float = 1.0,
+                 use_retargeting: bool = False,
                  ):
         """
         Initialize the end-effector pose control wrapper using joint commands with RTC support.
@@ -608,7 +609,8 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         self.sequence_length = sequence_length
         self.interpolator_option = interpolator_option
         self.custom_speed_factor = custom_speed_factor
-        self.ik_type =  'null_space' # 'jacobian' # 'null_space'
+        self.ik_type = 'null_space' # 'jacobian' # 'null_space'
+        self.use_retargeting = use_retargeting
         
         # Store previous step's joint directions for continuous movement during inference
         self.previous_joint_directions = np.zeros(7)  # [J1, J2, J3, J4, J5, J6, gripper]
@@ -739,15 +741,19 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         # self.last_step_complete = False
         # self.last_step_start_time = time.time()
         
-        # Check if action is chunked (2D) or single (1D)
-        if len(action.shape) == 2:
-            # action : [horizon, dim]
-            # return self._execute_step_chunk_logic(action)
-            return self._execute_step_chunk_logic_with_interpolator(action)
-        elif len(action.shape) == 1:
-            # Single action
-            # return self._execute_step_logic(action)
-            return self._execute_step_logic_with_interpolator(action)
+        try:
+            # Check if action is chunked (2D) or single (1D)
+            if len(action.shape) == 2:
+                # action : [horizon, dim]
+                # return self._execute_step_chunk_logic(action)
+                return self._execute_step_chunk_logic_with_interpolator(action)
+            elif len(action.shape) == 1:
+                # Single action
+                # return self._execute_step_logic(action)
+                return self._execute_step_logic_with_interpolator(action)
+        except Exception as e:
+            print(f"Error in step: {e}")
+            return np.zeros(21), 0.0, False, {'error': str(e)}
     
     def _execute_step_logic(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         """
@@ -1268,6 +1274,120 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         self.episode_step += 1
         return observation, reward, done, info
 
+    def _se3_residual(self, T_fk: np.ndarray, T_tgt: np.ndarray) -> np.ndarray:
+        """
+        SE(3) residual as 6D vector:
+        - translation error: p_fk - p_tgt   (in meters, assuming)
+        - rotation error:    log(R_tgt^T R_fk) as rotvec (in radians)
+        """
+        assert T_fk.shape == (4, 4)
+        assert T_tgt.shape == (4, 4)
+
+        p_fk = T_fk[:3, 3]
+        p_tgt = T_tgt[:3, 3]
+
+        R_fk = T_fk[:3, :3]
+        R_tgt = T_tgt[:3, :3]
+
+        # rotation error: identity when fk == tgt
+        R_err = R_tgt.T @ R_fk
+        rotvec = R.from_matrix(R_err).as_rotvec()  # 3-vector (axis * angle)
+
+        return np.concatenate([p_fk - p_tgt, rotvec], axis=0)
+
+    def _retarget_se3_trajectory(
+        self,
+        target_T: np.ndarray,          # [T,4,4]
+        q0: np.ndarray,                # [DoF]
+        *,
+        w_pos: float = 1.0,            # weight for position residual
+        w_rot: float = 1.0,            # weight for rotation residual
+        lambda_smooth: float = 1e-2,   # smoothness weight (q_t - q_{t-1})
+        bounds=None,                   # (lower, upper) each can be scalar or [DoF]
+        max_nfev: int = 50,
+        tol: float = 1e-6,
+        verbose: int = 0,
+    ):
+        """
+        Retarget SE(3) target trajectory into joint trajectory via per-timestep IK:
+            q_t = argmin_q  || e_se3(fk(q), T_target[t]) ||^2
+                            + lambda_smooth * || q - q_{t-1} ||^2
+
+        Returns:
+            q_traj: [T, DoF]
+            info:   dict with per-step cost and solver status
+        """
+        target_T = np.asarray(target_T)
+        q0 = np.asarray(q0).astype(float)
+
+        assert target_T.ndim == 3 and target_T.shape[1:] == (4, 4), "target_T must be [T,4,4]"
+        T = target_T.shape[0]
+        dof = q0.shape[0]
+
+        if bounds is None:
+            lb = -np.inf * np.ones(dof)
+            ub = +np.inf * np.ones(dof)
+        else:
+            lb, ub = bounds
+            lb = np.broadcast_to(np.asarray(lb, dtype=float), (dof,)).copy()
+            ub = np.broadcast_to(np.asarray(ub, dtype=float), (dof,)).copy()
+
+        # sqrt weights for least_squares residual scaling
+        s_pos = np.sqrt(w_pos)
+        s_rot = np.sqrt(w_rot)
+        s_sm  = np.sqrt(lambda_smooth)
+
+        q_prev = q0.copy()
+        q_traj = np.zeros((T, dof), dtype=float)
+        T_traj = np.zeros((T, 4, 4), dtype=float)
+
+        costs = []
+        statuses = []
+        nfev_list = []  # Track number of function evaluations per timestep
+
+        for t in range(T):
+            T_tgt = target_T[t]
+
+            def residual(q):
+                T_fk = self.compute_forward_kinematics(q)  # must return (4,4)
+                e6 = self._se3_residual(T_fk, T_tgt)   # [6] = [pos(3), rot(3)]
+                # scale residuals
+                e6_scaled = np.concatenate([s_pos * e6[:3], s_rot * e6[3:]], axis=0)
+                smooth = s_sm * (q - q_prev)      # [DoF]
+                return np.concatenate([e6_scaled, smooth], axis=0)
+
+            # First timestep may need more iterations if starting from poor initial guess
+            # Use more iterations for first timestep, fewer for subsequent (warm start)
+            current_max_nfev = max_nfev * 2 if t == 0 else max_nfev
+
+            res = least_squares(
+                residual,
+                x0=q_prev,             # warm start
+                bounds=(lb, ub),
+                max_nfev=current_max_nfev,
+                xtol=tol,
+                ftol=tol,
+                gtol=tol,
+                verbose=verbose,
+            )
+
+            q_prev = res.x
+            q_traj[t] = q_prev
+            T_traj[t] = self.compute_forward_kinematics(q_prev)
+            # (optional) store diagnostics
+            costs.append(res.cost)      # 0.5 * sum(residual^2)
+            statuses.append({"success": bool(res.success), "status": int(res.status), "message": res.message})
+            nfev_list.append(res.nfev)  # Number of function evaluations for this timestep
+
+        info = {
+            "costs": np.asarray(costs, dtype=float),
+            "statuses": statuses,
+            "weights": {"w_pos": w_pos, "w_rot": w_rot, "lambda_smooth": lambda_smooth},
+            "nfev_list": np.asarray(nfev_list, dtype=int),  # Function evaluations per timestep
+            "total_nfev": sum(nfev_list),  # Total function evaluations
+        }
+        return q_traj, T_traj, info
+
     def _execute_step_chunk_logic_with_interpolator(self, actions: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         """
         Execute a chunk of steps with end-effector pose control using jointCtrlCmd with interpolator.
@@ -1299,13 +1419,15 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         current_pos = current_ee_pose[:3]
         current_quat = current_ee_pose[3:7]
         current_gripper_pos = current_ee_pose[7] if self.has_gripper else 0.0
-        current_joint_pos = self.current_joint_pos
+        current_joint_pos = self.current_joint_pos.copy()
         
         # Pre-compute all IK for all actions in the chunk (like step_chunk in widowx_all.py)
         target_joint_positions = []
         target_gripper_positions = []
         target_positions_list = []
         target_orientations_list = []
+        target_T_list = []  # Store target SE(3) transformations for retargeting
+        ik_success_list = []  # Track IK success for each action
         
         for i in range(horizon):
             action = actions[i]
@@ -1330,6 +1452,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             
             # Calculate target joint positions using IK (similar to _execute_step_logic_with_interpolator)
             target_T = self._pose_to_transformation_matrix(target_position, target_orientation)
+            target_T_list.append(target_T.copy())
             
             # Use inverse kinematics to get target joint positions
             ik_type = self.ik_type # getattr(self, 'ik_type', 'jacobian')  # Default to 'jacobian' if not set
@@ -1358,6 +1481,8 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
                     joint_clip=True,
                 )
             
+            ik_success_list.append(success)
+            
             if not success:
                 print(f"Warning: Z1 IK failed to converge for action {i} (error_pos: {final_error_pos:.6f}, error_ori: {final_error_ori:.6f}, null_obj: {null_obj_val:.6f})")
                 if self.use_current_joint_pos_when_ik_fails:
@@ -1374,6 +1499,52 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
         # Convert to numpy arrays
         target_joint_positions = np.array(target_joint_positions)  # [horizon, 6]
         target_gripper_positions = np.array(target_gripper_positions)  # [horizon]
+        target_T_trajectory = np.array(target_T_list)  # [horizon, 4, 4]
+        
+        # Apply retargeting if enabled and IK failed at least once
+        if self.use_retargeting and not all(ik_success_list):
+            retarget_start_time = time.time()
+            print(f"\nZ1 env retargeting enabled: IK failed for {sum(1 - np.array(ik_success_list))}/{horizon} actions. Applying retargeting...")
+            
+            # Use IK results as initial guess for retargeting
+            q0_retarget = target_joint_positions[0].copy()
+            
+            # Get joint limits for bounds
+            joint_limits = self.joint_limits
+            q_min = np.array([limit[0] for limit in joint_limits])
+            q_max = np.array([limit[1] for limit in joint_limits])
+            
+            q0_retarget = np.clip(q0_retarget, q_min, q_max)
+
+            # Perform retargeting
+            q_traj_retargeted, T_traj_retargeted, retarget_info = self._retarget_se3_trajectory(
+                target_T_trajectory,
+                q0_retarget,
+                w_pos=1.0,
+                w_rot=0.5,
+                lambda_smooth=1e-3,
+                bounds=(q_min, q_max),
+                max_nfev=100,
+                tol=1e-6,
+                verbose=0,
+            )
+            
+            # Replace target_joint_positions with retargeted results
+            target_joint_positions = q_traj_retargeted.copy() # [horizon, 6]
+            target_T_trajectory = T_traj_retargeted.copy() # [horizon, 4, 4]
+            target_positions_list = list(target_T_trajectory[:, :3, 3])
+            target_orientations_list = list(R.from_matrix(target_T_trajectory[:, :3, :3]).as_quat())
+
+            retarget_time = time.time() - retarget_start_time
+            print(f"Z1 env retargeting completed. Time: {retarget_time:.4f}s, Final cost: {retarget_info['costs'][-1]:.6f}, Total function evaluations: {retarget_info['total_nfev']}")
+            
+
+        T_be_target = target_T_trajectory.copy() # [horizon, 4, 4] base coordinate
+        if self.T_E_C is not None:
+            T_bc_target = np.einsum('hij,jk->hik', T_be_target , self.T_E_C) # [horizon, 4, 4] camera coordinate
+        else:
+            T_bc_target = T_be_target.copy() # [horizon, 4, 4] camera coordinate
+
         
         # Store the last target as the current target (for info dict)
         self.target_position = target_positions_list[-1]
@@ -1516,6 +1687,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
                         'current_cam_pose': self._get_current_camera_pose_for_obs().copy(),
                         'position_error': position_error,
                         'orientation_error': orientation_error,
+                        'target_poses': T_bc_target.copy(),
                         'joint_directions': joint_directions.copy(),
                         'actual_joint_speed': actual_joint_speed,
                         'gripper_speed': gripper_speed,
@@ -1575,6 +1747,7 @@ class EEPoseCtrlJointCmdWrapper(Z1BaseEnv):
             'current_cam_pose': self._get_current_camera_pose_for_obs().copy(),
             'position_error': position_error,
             'orientation_error': orientation_error,
+            'target_poses': T_bc_target.copy(),
             'joint_directions': joint_directions.copy(),
             'actual_joint_speed': actual_joint_speed,
             'gripper_speed': gripper_speed,

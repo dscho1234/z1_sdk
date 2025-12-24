@@ -342,8 +342,8 @@ def retargeting_test_from_gpt():
 
     # charuco, view policy setting (from RHWE calibration, fk_debug fix) (After move to the edge)
     T_B_M_view = np.array([[-0.01867103, -0.00241674,  0.99982276,  0.74527762],
-                            [-0.02852406, -0.99958876, -0.00294884, -0.63116821],
-                            [ 0.99941872, -0.02857406,  0.01859442,  0.55722613],
+                            [-0.02852406, -0.99958876, -0.00294884, -0.63116821], #  original value -0.63116821
+                            [ 0.99941872, -0.02857406,  0.01859442,  0.55722613], # normal height : 0.55722613
                             [ 0.,          0.,          0.,          1.        ]])
 
     # charuco, view policy setting (from RHWE calibration, fk_debug fix) (After move to the edge)
@@ -391,7 +391,7 @@ def retargeting_test_from_gpt():
     episode_indices = sorted([int(key.split("_")[1]) for key in episode_keys])
     
     # for debug
-    episode_indices = [12]
+    episode_indices = [0]
     # Configuration for evaluation
     start_timestep = 0  # Start timestep (0-indexed, after downsampling)
     N = 24  # Number of steps to evaluate
@@ -491,7 +491,7 @@ def retargeting_test_from_gpt():
                 target_position,
                 target_orientation,
                 return_success=True,
-                ik_type='null_space'
+                ik_type='jacobian' # 'null_space'
             )
             ik_solvable_list.append(ik_success)
             
